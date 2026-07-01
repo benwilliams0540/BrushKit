@@ -1,42 +1,62 @@
 // brush-c is a native-only FFI shim. The crate compiles to an empty stub on wasm.
 #![cfg(not(target_family = "wasm"))]
 
-use brush_process::DataSource;
 use brush_process::burn_init_setup;
 use brush_process::config::TrainStreamConfig;
 use brush_process::message::TrainMessage;
-use brush_process::{create_process, message::ProcessMessage};
-use std::convert::TryFrom;
-use std::ffi::{CStr, c_char, c_void};
+use brush_process::{DataSource, create_process, message::ProcessMessage};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainExitCode {
     Success = 0,
     Error = 1,
+    Cancelled = 2,
 }
 
 #[repr(C)]
-pub enum ProgressMessage {
-    NewProcess,
-    Training { iter: u32 },
-    DoneTraining,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressMessageKind {
+    NewProcess = 0,
+    Training = 1,
+    CheckpointExported = 2,
+    DoneTraining = 3,
 }
 
-impl TryFrom<ProcessMessage> for ProgressMessage {
-    type Error = ();
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProgressMessage {
+    pub kind: ProgressMessageKind,
+    pub iter: u32,
+    pub path: *const c_char,
+}
 
-    fn try_from(value: ProcessMessage) -> Result<Self, Self::Error> {
-        match value {
-            ProcessMessage::NewProcess => Ok(Self::NewProcess),
-            ProcessMessage::TrainMessage(TrainMessage::TrainStep { iter, .. }) => {
-                Ok(Self::Training { iter })
-            }
-            ProcessMessage::TrainMessage(TrainMessage::DoneTraining) => Ok(Self::DoneTraining),
-            _ => Err(()),
+impl ProgressMessage {
+    fn new(kind: ProgressMessageKind) -> ProgressMessage {
+        ProgressMessage {
+            kind,
+            iter: 0,
+            path: ptr::null(),
         }
     }
+}
+
+#[repr(C)]
+pub struct BrushJob {
+    _private: [u8; 0],
+}
+
+struct BrushJobState {
+    cancellation_requested: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<TrainExitCode>>>,
+    result: Mutex<Option<TrainExitCode>>,
 }
 
 #[repr(C)]
@@ -49,20 +69,50 @@ pub struct TrainOptions {
     pub output_path: *const c_char,
 }
 
-impl TrainOptions {
+struct OwnedTrainOptions {
+    total_train_steps: u32,
+    refine_every: u32,
+    max_resolution: u32,
+    export_every: u32,
+    output_path: Option<String>,
+}
+
+impl OwnedTrainOptions {
     /// # Safety
     ///
-    /// If `output_path` is not null, it must be a valid pointer to a null-terminated C string.
-    unsafe fn into_train_stream_config(self) -> TrainStreamConfig {
-        let process_args = TrainStreamConfig::default();
-        let mut process_args = process_args;
-        if !self.output_path.is_null() {
-            // SAFETY: Path is not null, caller guarantees the string is a valid C-string.
-            process_args.process_config.export_path = unsafe {
-                CStr::from_ptr(self.output_path)
+    /// `options` must either be null or point to a valid `TrainOptions` value. If
+    /// `output_path` is not null, it must be a valid null-terminated C string.
+    unsafe fn copy_from(options: *const TrainOptions) -> Option<OwnedTrainOptions> {
+        if options.is_null() {
+            return None;
+        }
+
+        // SAFETY: The caller guarantees `options` points to a valid TrainOptions value.
+        let options = unsafe { *options };
+        let output_path = if options.output_path.is_null() {
+            None
+        } else {
+            // SAFETY: The caller guarantees `output_path` is a valid C string when non-null.
+            Some(
+                unsafe { CStr::from_ptr(options.output_path) }
                     .to_string_lossy()
-                    .into_owned()
-            };
+                    .into_owned(),
+            )
+        };
+
+        Some(OwnedTrainOptions {
+            total_train_steps: options.total_train_steps,
+            refine_every: options.refine_every,
+            max_resolution: options.max_resolution,
+            export_every: options.export_every,
+            output_path,
+        })
+    }
+
+    fn into_train_stream_config(self) -> TrainStreamConfig {
+        let mut process_args = TrainStreamConfig::default();
+        if let Some(output_path) = self.output_path {
+            process_args.process_config.export_path = output_path;
         }
         process_args.train_config.total_train_iters = self.total_train_steps;
         process_args.train_config.refine_every = self.refine_every;
@@ -78,33 +128,134 @@ pub type ProgressCallback =
 
 static SETUP: OnceCell<()> = OnceCell::const_new();
 
-/// Trains a model from a dataset and saves the result.
+/// Starts a Brush training job and returns an opaque job handle.
 ///
-/// This function is designed to be called from other languages via FFI. It will
-/// block the current thread until training is complete.
-///
-/// # Arguments
-///
-/// * `dataset_path` - A pointer to a null-terminated C string representing the path to the dataset.
-/// * `options` - A pointer to a `TrainOptions` struct.
-/// * `progress_callback` - A callback function that will be invoked with progress updates.
-/// * `user_data` - An opaque pointer passed to the `progress_callback`.
+/// The returned handle must be passed to `brush_job_release` exactly once.
+/// Call `brush_job_wait` to block until completion, and `brush_job_cancel` to
+/// request cooperative cancellation.
 ///
 /// # Safety
 ///
-/// The caller must uphold several invariants. Passing `null` for `dataset_path` or `options`
-/// is safe and will result in an error code, but if they are non-null, they must be valid.
+/// - `dataset_path` must point to a valid, null-terminated C string.
+/// - `options` must point to a valid `TrainOptions` value.
+/// - `options.output_path`, when non-null, must point to a valid C string.
+/// - `user_data` is passed back to `progress_callback` on the worker thread and
+///   must remain valid until the job reaches a terminal state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brush_train_start(
+    dataset_path: *const c_char,
+    options: *const TrainOptions,
+    progress_callback: ProgressCallback,
+    user_data: *mut c_void,
+) -> *mut BrushJob {
+    if dataset_path.is_null() || options.is_null() {
+        return ptr::null_mut();
+    }
+
+    // SAFETY: Checked non-null above; caller guarantees a valid C string.
+    let dataset_path = unsafe { CStr::from_ptr(dataset_path) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: Checked non-null above; caller guarantees options and output_path validity.
+    let Some(train_options) = (unsafe { OwnedTrainOptions::copy_from(options) }) else {
+        return ptr::null_mut();
+    };
+
+    let cancellation_requested = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation_requested);
+    let user_data_address = user_data as usize;
+
+    let Ok(handle) = std::thread::Builder::new()
+        .name("brush-c-train".to_owned())
+        .spawn(move || {
+            run_training_job(
+                dataset_path,
+                train_options,
+                progress_callback,
+                user_data_address,
+                worker_cancellation,
+            )
+        })
+    else {
+        return ptr::null_mut();
+    };
+
+    let state = Box::new(BrushJobState {
+        cancellation_requested,
+        handle: Mutex::new(Some(handle)),
+        result: Mutex::new(None),
+    });
+    Box::into_raw(state).cast::<BrushJob>()
+}
+
+/// Requests cooperative cancellation for a running Brush training job.
 ///
-/// - If `dataset_path` is not null, it must point to a valid, null-terminated C string. The
-///   memory it points to must be valid for reading for the duration of this call.
+/// # Safety
 ///
-/// - If `options` is not null, it must point to a valid `TrainOptions` struct. The memory it
-///   points to must be valid for reading for the duration of this call. It's `output_path` must
-///   be a valid, null-terminated C string if not null.
+/// `job` must be a handle returned by `brush_train_start` that has not been
+/// released yet. Passing null is safe and returns `false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brush_job_cancel(job: *mut BrushJob) -> bool {
+    let Some(state) = job_state(job) else {
+        return false;
+    };
+    state.cancellation_requested.store(true, Ordering::SeqCst);
+    true
+}
+
+/// Waits for a Brush training job to finish and returns its terminal status.
 ///
-/// - The `user_data` pointer is passed to `progress_callback` but is not dereferenced by this
-///   function. If it is not null, the caller must ensure it points to memory that remains
-///   valid for the entire duration of this function call, as the callback may dereference it.
+/// # Safety
+///
+/// `job` must be a handle returned by `brush_train_start` that has not been
+/// released yet. Passing null is safe and returns `TrainExitCode::Error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brush_job_wait(job: *mut BrushJob) -> TrainExitCode {
+    let Some(state) = job_state(job) else {
+        return TrainExitCode::Error;
+    };
+    wait_for_state(state)
+}
+
+/// Releases a Brush training job handle.
+///
+/// If the job is still running, release requests cancellation and waits for the
+/// worker to finish before freeing the handle.
+///
+/// # Safety
+///
+/// `job` must be a handle returned by `brush_train_start` and must not be used
+/// after this call. Passing null is safe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brush_job_release(job: *mut BrushJob) {
+    if job.is_null() {
+        return;
+    }
+
+    // SAFETY: The caller guarantees this handle came from Box::into_raw in brush_train_start.
+    let state = unsafe { Box::from_raw(job.cast::<BrushJobState>()) };
+    state.cancellation_requested.store(true, Ordering::SeqCst);
+    let _ = wait_for_state(&state);
+}
+
+/// Trains a model from a dataset and saves the result.
+///
+/// This compatibility wrapper blocks the current thread until training is
+/// complete. New native integrations should use `brush_train_start`,
+/// `brush_job_cancel`, `brush_job_wait`, and `brush_job_release`.
+///
+/// # Safety
+///
+/// The caller must uphold several invariants. Passing `null` for `dataset_path`
+/// or `options` is safe and will result in an error code, but if they are
+/// non-null, they must be valid.
+///
+/// - If `dataset_path` is not null, it must point to a valid, null-terminated C
+///   string.
+/// - If `options` is not null, it must point to a valid `TrainOptions` struct.
+///   Its `output_path` must be a valid, null-terminated C string if not null.
+/// - The `user_data` pointer is passed to `progress_callback` and must remain
+///   valid for the duration of this function call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn train_and_save(
     dataset_path: *const c_char,
@@ -112,24 +263,64 @@ pub unsafe extern "C" fn train_and_save(
     progress_callback: ProgressCallback,
     user_data: *mut c_void,
 ) -> TrainExitCode {
-    if dataset_path.is_null() || options.is_null() {
+    // SAFETY: This wrapper forwards the caller's FFI contract to the async job API.
+    let job = unsafe { brush_train_start(dataset_path, options, progress_callback, user_data) };
+    if job.is_null() {
         return TrainExitCode::Error;
     }
+    // SAFETY: `job` was returned by brush_train_start and has not been released.
+    let status = unsafe { brush_job_wait(job) };
+    // SAFETY: `job` was returned by brush_train_start and is no longer needed.
+    unsafe { brush_job_release(job) };
+    status
+}
 
-    // A Rust panic must not unwind across this `extern "C"` boundary (that
-    // aborts the whole process). Catch it and surface it as an error code.
+fn job_state<'a>(job: *mut BrushJob) -> Option<&'a BrushJobState> {
+    if job.is_null() {
+        return None;
+    }
+    // SAFETY: Callers pass handles returned by brush_train_start.
+    Some(unsafe { &*job.cast::<BrushJobState>() })
+}
+
+fn wait_for_state(state: &BrushJobState) -> TrainExitCode {
+    if let Some(result) = *state
+        .result
+        .lock()
+        .expect("Brush job result mutex poisoned")
+    {
+        return result;
+    }
+
+    let handle = state
+        .handle
+        .lock()
+        .expect("Brush job handle mutex poisoned")
+        .take();
+    let result = match handle {
+        Some(handle) => handle.join().unwrap_or(TrainExitCode::Error),
+        None => TrainExitCode::Error,
+    };
+
+    *state
+        .result
+        .lock()
+        .expect("Brush job result mutex poisoned") = Some(result);
+    result
+}
+
+fn run_training_job(
+    dataset_path: String,
+    train_options: OwnedTrainOptions,
+    progress_callback: ProgressCallback,
+    user_data_address: usize,
+    cancellation_requested: Arc<AtomicBool>,
+) -> TrainExitCode {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let dataset_path_str =
-            // SAFETY: Checked if dataset_path is not null, caller guarantees the string is a valid C-string.
-            unsafe { CStr::from_ptr(dataset_path).to_string_lossy().into_owned() };
-
-        let source = DataSource::Path(dataset_path_str);
-
-        // SAFETY: Option is checked to not be null before the future.
-        let train_options = unsafe { *options };
-        // SAFETY: Caller guarantees the output_path is a valid C-string if not null.
-        let process_args = unsafe { train_options.into_train_stream_config() };
+        let source = DataSource::Path(dataset_path);
+        let process_args = train_options.into_train_stream_config();
         let mut process = create_process(source, async move |_| Some(process_args));
+        let user_data = user_data_address as *mut c_void;
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -143,21 +334,75 @@ pub unsafe extern "C" fn train_and_save(
                     .await;
 
                 while let Some(message_result) = process.stream.next().await {
+                    if cancellation_requested.load(Ordering::SeqCst) {
+                        return TrainExitCode::Cancelled;
+                    }
                     match message_result {
                         Ok(message) => {
-                            if let Ok(progress_message) = message.try_into() {
-                                progress_callback(progress_message, user_data);
-                            }
+                            emit_progress_message(message, progress_callback, user_data);
                         }
                         Err(_) => {
                             return TrainExitCode::Error;
                         }
                     }
+                    if cancellation_requested.load(Ordering::SeqCst) {
+                        return TrainExitCode::Cancelled;
+                    }
                 }
 
-                TrainExitCode::Success
+                if cancellation_requested.load(Ordering::SeqCst) {
+                    TrainExitCode::Cancelled
+                } else {
+                    TrainExitCode::Success
+                }
             })
     }));
 
     result.unwrap_or(TrainExitCode::Error)
+}
+
+fn emit_progress_message(
+    message: ProcessMessage,
+    progress_callback: ProgressCallback,
+    user_data: *mut c_void,
+) {
+    match message {
+        ProcessMessage::NewProcess => {
+            progress_callback(
+                ProgressMessage::new(ProgressMessageKind::NewProcess),
+                user_data,
+            );
+        }
+        ProcessMessage::TrainMessage(TrainMessage::TrainStep { iter, .. }) => {
+            progress_callback(
+                ProgressMessage {
+                    kind: ProgressMessageKind::Training,
+                    iter,
+                    path: ptr::null(),
+                },
+                user_data,
+            );
+        }
+        ProcessMessage::TrainMessage(TrainMessage::CheckpointExported { iter, path }) => {
+            let path_string = path.to_string_lossy();
+            let path_cstring = CString::new(path_string.as_bytes()).ok();
+            progress_callback(
+                ProgressMessage {
+                    kind: ProgressMessageKind::CheckpointExported,
+                    iter,
+                    path: path_cstring
+                        .as_ref()
+                        .map_or(ptr::null(), |path| path.as_ptr()),
+                },
+                user_data,
+            );
+        }
+        ProcessMessage::TrainMessage(TrainMessage::DoneTraining) => {
+            progress_callback(
+                ProgressMessage::new(ProgressMessageKind::DoneTraining),
+                user_data,
+            );
+        }
+        _ => {}
+    }
 }

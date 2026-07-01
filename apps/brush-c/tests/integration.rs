@@ -1,73 +1,116 @@
 #![cfg(not(target_family = "wasm"))]
 
-use std::ffi::{CString, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::fs;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use brush_c::{ProgressMessage, TrainExitCode, TrainOptions, train_and_save};
+use brush_c::{
+    ProgressMessage, ProgressMessageKind, TrainExitCode, TrainOptions, brush_job_cancel,
+    brush_job_release, brush_job_wait, brush_train_start, train_and_save,
+};
 
 #[repr(C)]
 struct CallbackState {
     call_count: AtomicUsize,
-    finished_called: std::sync::atomic::AtomicBool,
+    training_count: AtomicUsize,
+    checkpoint_count: AtomicUsize,
+    checkpoint_iter: AtomicUsize,
+    finished_called: AtomicBool,
+    checkpoint_path: Mutex<Option<String>>,
+}
+
+impl CallbackState {
+    fn new() -> CallbackState {
+        CallbackState {
+            call_count: AtomicUsize::new(0),
+            training_count: AtomicUsize::new(0),
+            checkpoint_count: AtomicUsize::new(0),
+            checkpoint_iter: AtomicUsize::new(0),
+            finished_called: AtomicBool::new(false),
+            checkpoint_path: Mutex::new(None),
+        }
+    }
 }
 
 extern "C" fn test_progress_callback(process_message: ProgressMessage, user_data: *mut c_void) {
     if user_data.is_null() {
         return;
     }
-    // SAFETY: user_data is a pointer to a CallbackState struct
+    // SAFETY: user_data is a pointer to a CallbackState struct.
     let state = unsafe { (user_data as *const CallbackState).as_ref().unwrap() };
     state.call_count.fetch_add(1, Ordering::SeqCst);
 
-    match process_message {
-        ProgressMessage::NewProcess => {
+    match process_message.kind {
+        ProgressMessageKind::NewProcess => {
             println!("FFI Test: Training starting...");
         }
-        ProgressMessage::Training { iter } => {
-            println!("FFI Test: Training iteration: {iter:.2}%");
+        ProgressMessageKind::Training => {
+            state.training_count.fetch_add(1, Ordering::SeqCst);
+            println!("FFI Test: Training iteration: {}", process_message.iter);
         }
-        ProgressMessage::DoneTraining => {
-            println!("FFI Test: Training finished!");
+        ProgressMessageKind::CheckpointExported => {
+            state.checkpoint_count.fetch_add(1, Ordering::SeqCst);
             state
-                .finished_called
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+                .checkpoint_iter
+                .store(process_message.iter as usize, Ordering::SeqCst);
+            if !process_message.path.is_null() {
+                // SAFETY: Checkpoint path pointers are valid for the duration of this callback.
+                let path = unsafe { CStr::from_ptr(process_message.path) }
+                    .to_string_lossy()
+                    .into_owned();
+                *state.checkpoint_path.lock().unwrap() = Some(path);
+            }
+        }
+        ProgressMessageKind::DoneTraining => {
+            println!("FFI Test: Training finished!");
+            state.finished_called.store(true, Ordering::SeqCst);
         }
     }
 }
 
-#[test]
-fn test_train_and_save_ffi_short() {
+fn test_dataset_path() -> CString {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dataset_path = Path::new(manifest_dir)
         .join("tests")
         .join("data")
         .join("test_dataset");
+    CString::new(dataset_path.to_str().unwrap()).unwrap()
+}
 
+fn train_options(output_path: &CString, total_train_steps: u32) -> TrainOptions {
+    TrainOptions {
+        total_train_steps,
+        refine_every: 5,
+        export_every: total_train_steps,
+        max_resolution: 50,
+        output_path: output_path.as_ptr(),
+    }
+}
+
+fn output_files(output_path: &str) -> Vec<PathBuf> {
+    fs::read_dir(output_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect()
+}
+
+#[test]
+fn test_train_and_save_ffi_short() {
     let temp_dir = tempfile::Builder::new()
         .prefix("ffi_test_")
         .tempdir()
         .unwrap();
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
+    let dataset_path_cstr = test_dataset_path();
 
-    let dataset_path_cstr = CString::new(dataset_path.to_str().unwrap()).unwrap();
+    let mut callback_state = CallbackState::new();
+    let options = train_options(&output_path_cstr, 10);
 
-    let mut callback_state = CallbackState {
-        call_count: AtomicUsize::new(0),
-        finished_called: std::sync::atomic::AtomicBool::new(false),
-    };
-
-    let options = TrainOptions {
-        total_train_steps: 10,
-        refine_every: 5,
-        export_every: 10,
-        max_resolution: 50,
-        output_path: output_path_cstr.as_ptr(),
-    };
-
-    // SAFETY: paths are valid, user_data is valid for lifetime of callback_state
+    // SAFETY: paths are valid, user_data is valid for lifetime of callback_state.
     let status = unsafe {
         train_and_save(
             dataset_path_cstr.as_ptr(),
@@ -79,12 +122,97 @@ fn test_train_and_save_ffi_short() {
 
     assert!(matches!(status, TrainExitCode::Success));
     assert!(callback_state.call_count.load(Ordering::SeqCst) > 2);
+    assert!(callback_state.training_count.load(Ordering::SeqCst) > 0);
+    assert!(callback_state.finished_called.load(Ordering::SeqCst));
+    assert_eq!(callback_state.checkpoint_count.load(Ordering::SeqCst), 1);
+    assert_eq!(callback_state.checkpoint_iter.load(Ordering::SeqCst), 10);
 
-    let output_files: Vec<_> = fs::read_dir(output_path)
+    let checkpoint_path = callback_state
+        .checkpoint_path
+        .lock()
         .unwrap()
-        .filter_map(Result::ok)
-        .collect();
-    assert!(!output_files.is_empty(), "No output file was created");
+        .clone()
+        .expect("missing checkpoint path");
+    assert!(
+        Path::new(&checkpoint_path).exists(),
+        "checkpoint path does not exist: {checkpoint_path}"
+    );
+    assert!(
+        !output_files(output_path).is_empty(),
+        "No output file was created"
+    );
+}
+
+#[test]
+fn test_brush_job_start_wait_release() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_job_test_")
+        .tempdir()
+        .unwrap();
+    let output_path = temp_dir.path().to_str().unwrap();
+    let output_path_cstr = CString::new(output_path).unwrap();
+    let dataset_path_cstr = test_dataset_path();
+
+    let mut callback_state = CallbackState::new();
+    let options = train_options(&output_path_cstr, 10);
+
+    // SAFETY: paths are valid, user_data is valid until after wait completes.
+    let job = unsafe {
+        brush_train_start(
+            dataset_path_cstr.as_ptr(),
+            &options,
+            test_progress_callback,
+            std::ptr::from_mut(&mut callback_state).cast::<c_void>(),
+        )
+    };
+    assert!(!job.is_null());
+
+    // SAFETY: job came from brush_train_start and has not been released.
+    let status = unsafe { brush_job_wait(job) };
+    // SAFETY: job came from brush_train_start and is no longer needed.
+    unsafe { brush_job_release(job) };
+
+    assert!(matches!(status, TrainExitCode::Success));
+    assert!(callback_state.finished_called.load(Ordering::SeqCst));
+    assert_eq!(callback_state.checkpoint_count.load(Ordering::SeqCst), 1);
+    assert!(
+        !output_files(output_path).is_empty(),
+        "No output file was created"
+    );
+}
+
+#[test]
+fn test_brush_job_cancel() {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_job_cancel_")
+        .tempdir()
+        .unwrap();
+    let output_path = temp_dir.path().to_str().unwrap();
+    let output_path_cstr = CString::new(output_path).unwrap();
+    let dataset_path_cstr = test_dataset_path();
+
+    let mut callback_state = CallbackState::new();
+    let options = train_options(&output_path_cstr, 500);
+
+    // SAFETY: paths are valid, user_data is valid until after wait completes.
+    let job = unsafe {
+        brush_train_start(
+            dataset_path_cstr.as_ptr(),
+            &options,
+            test_progress_callback,
+            std::ptr::from_mut(&mut callback_state).cast::<c_void>(),
+        )
+    };
+    assert!(!job.is_null());
+
+    // SAFETY: job came from brush_train_start and has not been released.
+    assert!(unsafe { brush_job_cancel(job) });
+    // SAFETY: job came from brush_train_start and has not been released.
+    let status = unsafe { brush_job_wait(job) };
+    // SAFETY: job came from brush_train_start and is no longer needed.
+    unsafe { brush_job_release(job) };
+
+    assert!(matches!(status, TrainExitCode::Cancelled));
 }
 
 #[test]
@@ -98,18 +226,8 @@ fn test_train_and_save_ffi_invalid_path() {
     let output_path_cstr = CString::new(output_path).unwrap();
 
     let dataset_path_cstr = CString::new(invalid_dataset_path).unwrap();
-    let mut callback_state = CallbackState {
-        call_count: AtomicUsize::new(0),
-        finished_called: std::sync::atomic::AtomicBool::new(false),
-    };
-
-    let options = TrainOptions {
-        total_train_steps: 10,
-        refine_every: 5,
-        export_every: 10,
-        max_resolution: 50,
-        output_path: output_path_cstr.as_ptr(),
-    };
+    let mut callback_state = CallbackState::new();
+    let options = train_options(&output_path_cstr, 10);
 
     // SAFETY: The paths are valid, and the callback state is alive for the duration of the call.
     let status = unsafe {
@@ -126,20 +244,11 @@ fn test_train_and_save_ffi_invalid_path() {
 
 #[test]
 fn test_train_and_save_ffi_null_options() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dataset_path = Path::new(manifest_dir)
-        .join("tests")
-        .join("data")
-        .join("test_dataset");
+    let dataset_path_cstr = test_dataset_path();
 
-    let dataset_path_cstr = CString::new(dataset_path.to_str().unwrap()).unwrap();
+    let mut callback_state = CallbackState::new();
 
-    let mut callback_state = CallbackState {
-        call_count: AtomicUsize::new(0),
-        finished_called: std::sync::atomic::AtomicBool::new(false),
-    };
-
-    // SAFETY: The paths are valid, and the callback state is alive for the duration of the call.
+    // SAFETY: The path is valid, and the callback state is alive for the duration of the call.
     let status = unsafe {
         train_and_save(
             dataset_path_cstr.as_ptr(),
@@ -161,13 +270,7 @@ fn test_train_and_save_ffi_null_dataset() {
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
 
-    let options = TrainOptions {
-        total_train_steps: 10,
-        refine_every: 5,
-        export_every: 10,
-        max_resolution: 50,
-        output_path: output_path_cstr.as_ptr(),
-    };
+    let options = train_options(&output_path_cstr, 10);
 
     // SAFETY: The paths are valid, and the callback state is null.
     let status_null_dataset = unsafe {
