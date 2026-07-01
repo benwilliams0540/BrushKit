@@ -35,6 +35,12 @@ pub enum TrainMessage {
         avg_psnr: f32,
         avg_ssim: f32,
     },
+    /// A checkpoint was exported successfully.
+    #[allow(unused)]
+    CheckpointExported {
+        iter: u32,
+        path: PathBuf,
+    },
     DoneTraining,
 }
 

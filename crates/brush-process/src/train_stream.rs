@@ -240,8 +240,20 @@ pub(crate) async fn train_stream(
                         .await
                         .with_context(|| "Export at LOD boundary failed");
 
-                if let Err(error) = res {
-                    emitter.emit(ProcessMessage::Warning { error }).await;
+                match res {
+                    Ok(path) => {
+                        emitter
+                            .emit(ProcessMessage::TrainMessage(
+                                TrainMessage::CheckpointExported {
+                                    iter: exp_iter,
+                                    path,
+                                },
+                            ))
+                            .await;
+                    }
+                    Err(error) => {
+                        emitter.emit(ProcessMessage::Warning { error }).await;
+                    }
                 }
             }
 
@@ -389,8 +401,20 @@ pub(crate) async fn train_stream(
                         .await
                         .with_context(|| format!("Export at iteration {iter} failed"));
 
-                if let Err(error) = res {
-                    emitter.emit(ProcessMessage::Warning { error }).await;
+                match res {
+                    Ok(path) => {
+                        emitter
+                            .emit(ProcessMessage::TrainMessage(
+                                TrainMessage::CheckpointExported {
+                                    iter: exp_iter,
+                                    path,
+                                },
+                            ))
+                            .await;
+                    }
+                    Err(error) => {
+                        emitter.emit(ProcessMessage::Warning { error }).await;
+                    }
                 }
             }
         }
@@ -565,7 +589,7 @@ async fn export_checkpoint(
     export_name: &str,
     iter: u32,
     total_steps: u32,
-) -> Result<(), anyhow::Error> {
+) -> Result<PathBuf, anyhow::Error> {
     tokio::fs::create_dir_all(&export_path)
         .await
         .with_context(|| format!("Creating export directory {}", export_path.display()))?;
@@ -574,8 +598,9 @@ async fn export_checkpoint(
     let splat_data = brush_serde::splat_to_ply(splats)
         .await
         .context("Serializing splat data")?;
-    tokio::fs::write(export_path.join(&export_name), splat_data)
+    let output_path = export_path.join(&export_name);
+    tokio::fs::write(&output_path, splat_data)
         .await
         .context(format!("Failed to export ply {export_path:?}"))?;
-    Ok(())
+    Ok(output_path)
 }
