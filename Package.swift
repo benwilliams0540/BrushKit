@@ -13,7 +13,17 @@ let package = Package(
   targets: [
     .target(
       name: "BrushKit",
-      dependencies: ["BrushKitFFI"]
+      dependencies: ["BrushKitFFI"],
+      linkerSettings: [
+        .linkedFramework("QuartzCore"),
+        .linkedFramework("Metal"),
+        .linkedFramework("Foundation"),
+        .linkedFramework("CoreFoundation"),
+        .linkedLibrary("objc"),
+        .linkedLibrary("iconv"),
+        .linkedLibrary("c"),
+        .linkedLibrary("m"),
+      ]
     ),
     .binaryTarget(
       name: "BrushKitFFI",
