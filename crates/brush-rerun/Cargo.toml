@@ -5,6 +5,10 @@ version.workspace = true
 readme.workspace = true
 license.workspace = true
 
+[features]
+default = ["rerun"]
+rerun = ["dep:glam", "dep:image", "dep:log", "dep:rerun"]
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
@@ -20,10 +24,10 @@ burn-cubecl.workspace = true
 tokio.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-rerun.workspace = true
-glam.workspace = true
-image.workspace = true
-log.workspace = true
+rerun = { workspace = true, optional = true }
+glam = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
 
 [lints]
 workspace = true

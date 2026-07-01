@@ -1,7 +1,7 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "rerun", not(target_family = "wasm")))]
 pub mod burn_to_rerun;
 
 // visualize_tools has a noop implementation for WASM.

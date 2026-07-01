@@ -7,12 +7,15 @@ readme.workspace = true
 license.workspace = true
 
 [features]
+default = ["dialogs", "rerun"]
 debug-validation = ["brush-train/debug-validation"]
+dialogs = ["brush-vfs/dialogs"]
+rerun = ["brush-rerun/rerun"]
 
 [dependencies]
 brush-render.path = "../brush-render"
 brush-render-bwd.path = "../brush-render-bwd"
-brush-vfs.path = "../brush-vfs"
+brush-vfs = { path = "../brush-vfs", default-features = false }
 brush-serde.path = "../brush-serde"
 
 burn.workspace = true
@@ -41,7 +44,7 @@ brush-async.path = "../brush-async"
 
 brush-train = { path = "../brush-train" }
 brush-dataset = { path = "../brush-dataset"}
-brush-rerun = { path = "../brush-rerun" }
+brush-rerun = { path = "../brush-rerun", default-features = false }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
