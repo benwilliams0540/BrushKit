@@ -65,23 +65,28 @@ pub struct TrainOptions {
     pub total_train_steps: u32,
     pub refine_every: u32,
     pub max_resolution: u32,
+    pub max_splats: u32,
     pub export_every: u32,
     pub output_path: *const c_char,
+    pub export_name: *const c_char,
 }
 
 struct OwnedTrainOptions {
     total_train_steps: u32,
     refine_every: u32,
     max_resolution: u32,
+    max_splats: u32,
     export_every: u32,
     output_path: Option<String>,
+    export_name: Option<String>,
 }
 
 impl OwnedTrainOptions {
     /// # Safety
     ///
     /// `options` must either be null or point to a valid `TrainOptions` value. If
-    /// `output_path` is not null, it must be a valid null-terminated C string.
+    /// `output_path` or `export_name` is not null, it must be a valid
+    /// null-terminated C string.
     unsafe fn copy_from(options: *const TrainOptions) -> Option<OwnedTrainOptions> {
         if options.is_null() {
             return None;
@@ -99,13 +104,25 @@ impl OwnedTrainOptions {
                     .into_owned(),
             )
         };
+        let export_name = if options.export_name.is_null() {
+            None
+        } else {
+            // SAFETY: The caller guarantees `export_name` is a valid C string when non-null.
+            Some(
+                unsafe { CStr::from_ptr(options.export_name) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
 
         Some(OwnedTrainOptions {
             total_train_steps: options.total_train_steps,
             refine_every: options.refine_every,
             max_resolution: options.max_resolution,
+            max_splats: options.max_splats,
             export_every: options.export_every,
             output_path,
+            export_name,
         })
     }
 
@@ -114,8 +131,14 @@ impl OwnedTrainOptions {
         if let Some(output_path) = self.output_path {
             process_args.process_config.export_path = output_path;
         }
+        if let Some(export_name) = self.export_name {
+            process_args.process_config.export_name = export_name;
+        }
         process_args.train_config.total_train_iters = self.total_train_steps;
         process_args.train_config.refine_every = self.refine_every;
+        if self.max_splats > 0 {
+            process_args.train_config.max_splats = self.max_splats;
+        }
         process_args.load_config.max_resolution = self.max_resolution;
         process_args.process_config.export_every = self.export_every;
         process_args.process_config.eval_save_to_disk = true;
@@ -138,7 +161,8 @@ static SETUP: OnceCell<()> = OnceCell::const_new();
 ///
 /// - `dataset_path` must point to a valid, null-terminated C string.
 /// - `options` must point to a valid `TrainOptions` value.
-/// - `options.output_path`, when non-null, must point to a valid C string.
+/// - `options.output_path` and `options.export_name`, when non-null, must point
+///   to valid C strings.
 /// - `user_data` is passed back to `progress_callback` on the worker thread and
 ///   must remain valid until the job reaches a terminal state.
 #[unsafe(no_mangle)]
@@ -253,7 +277,8 @@ pub unsafe extern "C" fn brush_job_release(job: *mut BrushJob) {
 /// - If `dataset_path` is not null, it must point to a valid, null-terminated C
 ///   string.
 /// - If `options` is not null, it must point to a valid `TrainOptions` struct.
-///   Its `output_path` must be a valid, null-terminated C string if not null.
+///   Its `output_path` and `export_name` must be valid, null-terminated C
+///   strings if not null.
 /// - The `user_data` pointer is passed to `progress_callback` and must remain
 ///   valid for the duration of this function call.
 #[unsafe(no_mangle)]

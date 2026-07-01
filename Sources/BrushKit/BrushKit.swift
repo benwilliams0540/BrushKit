@@ -6,20 +6,26 @@ public struct BrushTrainingOptions: Equatable, Sendable {
   public var totalTrainSteps: UInt32
   public var refineEvery: UInt32
   public var maxResolution: UInt32
+  public var maxSplats: UInt32
   public var exportEvery: UInt32
+  public var exportName: String
   public var outputURL: URL
 
   public init(
     totalTrainSteps: UInt32,
     refineEvery: UInt32 = 5,
     maxResolution: UInt32,
+    maxSplats: UInt32 = 10_000_000,
     exportEvery: UInt32,
+    exportName: String = "export_{iter}.ply",
     outputURL: URL
   ) {
     self.totalTrainSteps = totalTrainSteps
     self.refineEvery = refineEvery
     self.maxResolution = maxResolution
+    self.maxSplats = maxSplats
     self.exportEvery = exportEvery
+    self.exportName = exportName
     self.outputURL = outputURL
   }
 }
@@ -119,6 +125,7 @@ public enum BrushKit {
   ) throws -> BrushTrainingJob {
     let datasetPath = datasetURL.path(percentEncoded: false)
     let outputPath = options.outputURL.path(percentEncoded: false)
+    let exportName = options.exportName
     guard let datasetCString = strdup(datasetPath) else {
       throw BrushKitError.invalidPath(datasetPath)
     }
@@ -127,13 +134,19 @@ public enum BrushKit {
       throw BrushKitError.invalidPath(outputPath)
     }
     defer { free(outputCString) }
+    guard let exportNameCString = strdup(exportName) else {
+      throw BrushKitError.invalidPath(exportName)
+    }
+    defer { free(exportNameCString) }
 
     var ffiOptions = TrainOptions(
       total_train_steps: options.totalTrainSteps,
       refine_every: options.refineEvery,
       max_resolution: options.maxResolution,
+      max_splats: options.maxSplats,
       export_every: options.exportEvery,
-      output_path: UnsafePointer(outputCString)
+      output_path: UnsafePointer(outputCString),
+      export_name: UnsafePointer(exportNameCString)
     )
     let callbackBox = Unmanaged.passRetained(BrushProgressCallbackBox(events: events))
     guard let handle = brush_train_start(

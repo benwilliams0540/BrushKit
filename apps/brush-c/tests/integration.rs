@@ -79,14 +79,24 @@ fn test_dataset_path() -> CString {
     CString::new(dataset_path.to_str().unwrap()).unwrap()
 }
 
-fn train_options(output_path: &CString, total_train_steps: u32) -> TrainOptions {
+fn train_options(
+    output_path: &CString,
+    export_name: &CString,
+    total_train_steps: u32,
+) -> TrainOptions {
     TrainOptions {
         total_train_steps,
         refine_every: 5,
-        export_every: total_train_steps,
         max_resolution: 50,
+        max_splats: 1000,
+        export_every: total_train_steps,
         output_path: output_path.as_ptr(),
+        export_name: export_name.as_ptr(),
     }
+}
+
+fn export_name_template() -> CString {
+    CString::new("component-0_{iter}.ply").unwrap()
 }
 
 fn output_files(output_path: &str) -> Vec<PathBuf> {
@@ -105,10 +115,11 @@ fn test_train_and_save_ffi_short() {
         .unwrap();
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
+    let export_name_cstr = export_name_template();
     let dataset_path_cstr = test_dataset_path();
 
     let mut callback_state = CallbackState::new();
-    let options = train_options(&output_path_cstr, 10);
+    let options = train_options(&output_path_cstr, &export_name_cstr, 10);
 
     // SAFETY: paths are valid, user_data is valid for lifetime of callback_state.
     let status = unsafe {
@@ -138,6 +149,10 @@ fn test_train_and_save_ffi_short() {
         "checkpoint path does not exist: {checkpoint_path}"
     );
     assert!(
+        checkpoint_path.ends_with("component-0_10.ply"),
+        "checkpoint path did not use requested export name: {checkpoint_path}"
+    );
+    assert!(
         !output_files(output_path).is_empty(),
         "No output file was created"
     );
@@ -151,10 +166,11 @@ fn test_brush_job_start_wait_release() {
         .unwrap();
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
+    let export_name_cstr = export_name_template();
     let dataset_path_cstr = test_dataset_path();
 
     let mut callback_state = CallbackState::new();
-    let options = train_options(&output_path_cstr, 10);
+    let options = train_options(&output_path_cstr, &export_name_cstr, 10);
 
     // SAFETY: paths are valid, user_data is valid until after wait completes.
     let job = unsafe {
@@ -189,10 +205,11 @@ fn test_brush_job_cancel() {
         .unwrap();
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
+    let export_name_cstr = export_name_template();
     let dataset_path_cstr = test_dataset_path();
 
     let mut callback_state = CallbackState::new();
-    let options = train_options(&output_path_cstr, 500);
+    let options = train_options(&output_path_cstr, &export_name_cstr, 500);
 
     // SAFETY: paths are valid, user_data is valid until after wait completes.
     let job = unsafe {
@@ -224,10 +241,11 @@ fn test_train_and_save_ffi_invalid_path() {
         .unwrap();
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
+    let export_name_cstr = export_name_template();
 
     let dataset_path_cstr = CString::new(invalid_dataset_path).unwrap();
     let mut callback_state = CallbackState::new();
-    let options = train_options(&output_path_cstr, 10);
+    let options = train_options(&output_path_cstr, &export_name_cstr, 10);
 
     // SAFETY: The paths are valid, and the callback state is alive for the duration of the call.
     let status = unsafe {
@@ -269,8 +287,9 @@ fn test_train_and_save_ffi_null_dataset() {
         .unwrap();
     let output_path = temp_dir.path().to_str().unwrap();
     let output_path_cstr = CString::new(output_path).unwrap();
+    let export_name_cstr = export_name_template();
 
-    let options = train_options(&output_path_cstr, 10);
+    let options = train_options(&output_path_cstr, &export_name_cstr, 10);
 
     // SAFETY: The paths are valid, and the callback state is null.
     let status_null_dataset = unsafe {
