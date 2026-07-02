@@ -25,6 +25,10 @@ images/
 /target
 /src/splat_render/shaders/mod.rs
 
+# Local BrushKit binary package output. SwiftPM consumers use the GitHub
+# release asset instead of tracking this directory in the fork.
+artifacts/
+
 /node_modules
 
 # Ignore bench files by now, need a better solution.
