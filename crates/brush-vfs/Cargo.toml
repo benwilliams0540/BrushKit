@@ -5,8 +5,12 @@ version.workspace = true
 readme.workspace = true
 license.workspace = true
 
+[features]
+default = ["dialogs"]
+dialogs = ["dep:rrfd"]
+
 [dependencies]
-rrfd.path = "../rrfd"
+rrfd = { path = "../rrfd", optional = true }
 
 thiserror.workspace = true
 async_zip.workspace = true

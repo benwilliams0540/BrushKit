@@ -48,6 +48,9 @@ First install rust 1.88+. You can run tests with `cargo test --all`. Brush uses 
 ### Windows/macOS/Linux
 Use `cargo run --release` from the workspace root to make an optimized build. Use `cargo run` to run a debug build. 
 
+### BrushKit Swift package
+The BrushKit SwiftPM wrapper builds its local FFI binary with `scripts/build_brushkit_xcframework.sh`, which writes `artifacts/BrushKitFFI.xcframework`. That directory is intentionally ignored in this fork; use the packaged `BrushKitFFI.xcframework.zip` from the GitHub release asset when resolving the Swift package remotely.
+
 ### Web
 Brush can be compiled to WASM. Run `npm run dev` to start the demo website using Next.js, see the web directory in app/brush-app/web.
 

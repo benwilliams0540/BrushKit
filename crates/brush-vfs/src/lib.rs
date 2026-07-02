@@ -107,7 +107,7 @@ enum VfsContainer {
     #[cfg(not(target_family = "wasm"))]
     Directory { base_path: PathBuf },
     /// WASM directory - uses File System Access API to read files on demand
-    #[cfg(target_family = "wasm")]
+    #[cfg(all(feature = "dialogs", target_family = "wasm"))]
     Directory {
         dir_handle: rrfd::wasm::DirectoryHandle,
     },
@@ -263,7 +263,7 @@ impl BrushVfs {
         }
     }
 
-    #[cfg(target_family = "wasm")]
+    #[cfg(all(feature = "dialogs", target_family = "wasm"))]
     pub async fn from_directory_handle(
         dir_handle: rrfd::wasm::DirectoryHandle,
     ) -> Result<Self, VfsConstructError> {
@@ -356,7 +356,7 @@ impl BrushVfs {
                 let reader: Box<dyn DynRead> = Box::new(file);
                 Ok(reader)
             }
-            #[cfg(target_family = "wasm")]
+            #[cfg(all(feature = "dialogs", target_family = "wasm"))]
             VfsContainer::Directory { dir_handle } => {
                 use futures_util::StreamExt;
                 use tokio_util::io::StreamReader;
@@ -423,7 +423,7 @@ impl BrushVfs {
             VfsContainer::Streaming { .. } => None,
             #[cfg(not(target_family = "wasm"))]
             VfsContainer::Directory { base_path } => Some(base_path.clone()),
-            #[cfg(target_family = "wasm")]
+            #[cfg(all(feature = "dialogs", target_family = "wasm"))]
             VfsContainer::Directory { .. } => None,
         }
     }

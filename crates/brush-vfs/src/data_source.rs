@@ -1,11 +1,13 @@
 use crate::{BrushVfs, VfsConstructError};
 use core::fmt;
+#[cfg(feature = "dialogs")]
 use rrfd::PickFileError;
 use serde::Deserialize;
 #[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "dialogs")]
 use tokio::io::BufReader;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -17,7 +19,7 @@ pub enum DataSource {
     /// A directory handle the host has already obtained (e.g. via JS
     /// `showDirectoryPicker`). Constructed programmatically — never
     /// (de)serialised from CLI args or saved state.
-    #[cfg(target_family = "wasm")]
+    #[cfg(all(feature = "dialogs", target_family = "wasm"))]
     #[serde(skip)]
     PickedDirectory(rrfd::wasm::DirectoryHandle, String),
 }
@@ -44,7 +46,7 @@ impl fmt::Display for DataSource {
             Self::PickDirectory => write!(f, "Directory"),
             Self::Url(_) => write!(f, "URL"),
             Self::Path(_) => write!(f, "Path"),
-            #[cfg(target_family = "wasm")]
+            #[cfg(all(feature = "dialogs", target_family = "wasm"))]
             Self::PickedDirectory(_, name) => write!(f, "{name}"),
         }
     }
@@ -53,8 +55,11 @@ impl fmt::Display for DataSource {
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum DataSourceError {
+    #[cfg(feature = "dialogs")]
     #[error(transparent)]
     FilePicking(#[from] PickFileError),
+    #[error("File dialogs are unavailable in this build")]
+    FilePickingUnavailable,
     #[error(transparent)]
     VfsError(#[from] VfsConstructError),
     #[cfg(not(target_family = "wasm"))]
@@ -70,23 +75,37 @@ impl DataSource {
     pub async fn into_vfs(self) -> Result<Arc<BrushVfs>, DataSourceError> {
         match self {
             Self::PickFile => {
-                let picked = rrfd::pick_file().await?;
-                log::info!("Got file: {}", picked.name);
-                let reader = BufReader::new(picked.reader);
-                Ok(Arc::new(
-                    BrushVfs::from_reader(reader, Some(picked.name)).await?,
-                ))
+                #[cfg(feature = "dialogs")]
+                {
+                    let picked = rrfd::pick_file().await?;
+                    log::info!("Got file: {}", picked.name);
+                    let reader = BufReader::new(picked.reader);
+                    Ok(Arc::new(
+                        BrushVfs::from_reader(reader, Some(picked.name)).await?,
+                    ))
+                }
+                #[cfg(not(feature = "dialogs"))]
+                {
+                    Err(DataSourceError::FilePickingUnavailable)
+                }
             }
             Self::PickDirectory => {
-                #[cfg(not(target_family = "wasm"))]
+                #[cfg(feature = "dialogs")]
                 {
-                    let picked = rrfd::pick_directory().await?;
-                    Ok(Arc::new(BrushVfs::from_path(&picked).await?))
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        let picked = rrfd::pick_directory().await?;
+                        Ok(Arc::new(BrushVfs::from_path(&picked).await?))
+                    }
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let dir_handle = rrfd::wasm::pick_directory_handle().await?;
+                        Ok(Arc::new(BrushVfs::from_directory_handle(dir_handle).await?))
+                    }
                 }
-                #[cfg(target_family = "wasm")]
+                #[cfg(not(feature = "dialogs"))]
                 {
-                    let dir_handle = rrfd::wasm::pick_directory_handle().await?;
-                    Ok(Arc::new(BrushVfs::from_directory_handle(dir_handle).await?))
+                    Err(DataSourceError::FilePickingUnavailable)
                 }
             }
             Self::Url(url) => Self::fetch_url(url).await,
@@ -96,7 +115,7 @@ impl DataSource {
             Self::Path(_) => {
                 panic!("Cannot load from filesystem path on WASM");
             }
-            #[cfg(target_family = "wasm")]
+            #[cfg(all(feature = "dialogs", target_family = "wasm"))]
             Self::PickedDirectory(handle, _) => {
                 Ok(Arc::new(BrushVfs::from_directory_handle(handle).await?))
             }
