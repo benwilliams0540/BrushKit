@@ -6,11 +6,18 @@ pub mod train_stream;
 
 pub use brush_vfs::DataSource;
 
-use burn_wgpu::{
-    AutoCompiler, RuntimeOptions, WgpuDevice,
-    graphics::{AutoGraphicsApi, GraphicsApi},
-};
+use burn_wgpu::{AutoCompiler, RuntimeOptions, WgpuDevice, graphics::GraphicsApi};
 use wgpu::{Adapter, Device, Queue};
+
+#[cfg(not(target_vendor = "apple"))]
+use burn_wgpu::graphics::AutoGraphicsApi;
+#[cfg(target_vendor = "apple")]
+use burn_wgpu::graphics::Metal;
+
+#[cfg(not(target_vendor = "apple"))]
+type BrushGraphicsApi = AutoGraphicsApi;
+#[cfg(target_vendor = "apple")]
+type BrushGraphicsApi = Metal;
 
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -31,7 +38,7 @@ fn burn_options() -> RuntimeOptions {
 }
 
 pub async fn burn_init_setup() -> WgpuDevice {
-    burn_wgpu::init_setup_async::<AutoGraphicsApi>(&WgpuDevice::DefaultDevice, burn_options())
+    burn_wgpu::init_setup_async::<BrushGraphicsApi>(&WgpuDevice::DefaultDevice, burn_options())
         .await;
     connect_device(WgpuDevice::DefaultDevice);
     WgpuDevice::DefaultDevice
@@ -47,7 +54,7 @@ pub fn burn_init_device(adapter: Adapter, device: Device, queue: Queue) -> WgpuD
         adapter,
         device,
         queue,
-        backend: AutoGraphicsApi::backend(),
+        backend: BrushGraphicsApi::backend(),
     };
     let burn = burn_wgpu::init_device(setup, burn_options());
     connect_device(burn.clone());
