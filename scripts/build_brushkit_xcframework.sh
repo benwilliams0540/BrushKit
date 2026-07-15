@@ -2,13 +2,12 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-target="${BRUSHKIT_TARGET:-aarch64-apple-darwin}"
 artifact_name="BrushKitFFI"
-build_dir="$repo_root/target/brushkit-ffi/$target"
-include_dir="$build_dir/include"
-source_lib="$repo_root/target/$target/release/libbrush_c.a"
-stripped_lib="$build_dir/libbrush_c.a"
+targets="${BRUSHKIT_TARGETS:-${BRUSHKIT_TARGET:-aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim}}"
+build_root="$repo_root/target/brushkit-ffi"
+include_dir="$build_root/include"
 output_dir="$repo_root/artifacts/$artifact_name.xcframework"
+zip_path="$repo_root/artifacts/$artifact_name.xcframework.zip"
 
 if ! command -v cbindgen >/dev/null 2>&1; then
   echo "error: cbindgen is required. Install it with: cargo install cbindgen --locked" >&2
@@ -28,19 +27,35 @@ module BrushKitFFI {
 }
 MODULEMAP
 
-cargo build -p brush-c --release --target "$target"
+xcframework_args=()
+for target in $targets; do
+  build_dir="$build_root/$target"
+  source_lib="$repo_root/target/$target/release/libbrush_c.a"
+  stripped_lib="$build_dir/libbrush_c.a"
 
-cp "$source_lib" "$stripped_lib"
-if xcrun strip -S -x "$stripped_lib" 2>/dev/null; then
-  xcrun ranlib "$stripped_lib"
-else
-  echo "warning: strip failed for $stripped_lib; packaging unstripped archive" >&2
-fi
+  cargo build -p brush-c --release --target "$target"
+
+  mkdir -p "$build_dir"
+  cp "$source_lib" "$stripped_lib"
+  if xcrun strip -S -x "$stripped_lib" 2>/dev/null; then
+    xcrun ranlib "$stripped_lib"
+  else
+    echo "warning: strip failed for $stripped_lib; packaging unstripped archive" >&2
+  fi
+
+  xcframework_args+=(
+    -library "$stripped_lib"
+    -headers "$include_dir"
+  )
+done
 
 rm -rf "$output_dir"
 xcodebuild -create-xcframework \
-  -library "$stripped_lib" \
-  -headers "$include_dir" \
+  "${xcframework_args[@]}" \
   -output "$output_dir"
 
 du -sh "$output_dir"
+
+rm -f "$zip_path"
+ditto -c -k --sequesterRsrc --keepParent "$output_dir" "$zip_path"
+swift package compute-checksum "$zip_path"
