@@ -4,7 +4,10 @@ use brush_serde::{DeserializeError, SplatMessage, load_splat_from_ply};
 use brush_vfs::BrushVfs;
 use image::ImageError;
 use itertools::{Either, Itertools};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 pub mod colmap;
 pub mod nerfstudio;
@@ -14,6 +17,8 @@ use thiserror::Error;
 
 pub struct DatasetLoadResult {
     pub init_splat: Option<SplatMessage>,
+    /// Dataset-root-relative path when an initializer was loaded from the VFS.
+    pub init_splat_path: Option<PathBuf>,
     pub dataset: Dataset,
     pub warnings: Vec<String>,
 }
@@ -56,6 +61,7 @@ pub enum DatasetError {
 pub async fn load_dataset(
     vfs: Arc<BrushVfs>,
     load_args: &LoadDatasetConfig,
+    explicit_initializer_path: Option<&Path>,
 ) -> Result<DatasetLoadResult, DatasetError> {
     let mut dataset = colmap::load_dataset(vfs.clone(), load_args).await;
 
@@ -84,14 +90,23 @@ pub async fn load_dataset(
         .into());
     }
 
+    // If the host supplied a path, resolve exactly that dataset-root-relative
+    // file. Absolute paths and traversal are forbidden because the dataset VFS
+    // is the complete authority for training inputs.
+    let explicit_initializer_path = explicit_initializer_path
+        .map(validate_initializer_path)
+        .transpose()?;
+
     // If there's an initial ply file, override the init stream with that.
-    let mut ply_paths: Vec<_> = vfs.files_with_extension("ply").collect();
+    let mut ply_paths: Vec<PathBuf> = vfs.files_with_extension("ply").collect();
     ply_paths.sort();
 
-    let main_ply = ply_paths
-        .iter()
-        .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
-        .or_else(|| ply_paths.last());
+    let main_ply = explicit_initializer_path.as_ref().or_else(|| {
+        ply_paths
+            .iter()
+            .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
+            .or_else(|| ply_paths.last())
+    });
 
     let init_splat = if let Some(main_ply) = main_ply {
         log::info!("Using ply {main_ply:?} as initial point cloud.");
@@ -106,9 +121,29 @@ pub async fn load_dataset(
 
     Ok(DatasetLoadResult {
         init_splat,
+        init_splat_path: main_ply.cloned(),
         dataset: result.dataset,
         warnings: result.warnings,
     })
+}
+
+fn validate_initializer_path(path: &Path) -> Result<PathBuf, DatasetError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .extension()
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("ply"))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(FormatError::InvalidFormat(format!(
+            "explicit initializer path must be a dataset-root-relative .ply path without traversal: {}",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only

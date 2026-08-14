@@ -1,0 +1,22 @@
+ply
+format ascii 1.0
+comment BrushKit ABI V2 deterministic strong initializer fixture
+element vertex 3
+property float x
+property float y
+property float z
+property float scale_0
+property float scale_1
+property float scale_2
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
+property float opacity
+property float f_dc_0
+property float f_dc_1
+property float f_dc_2
+end_header
+0.0 0.0 0.0 -3.0 -3.5 -4.0 1.0 0.0 0.0 0.0 0.25 0.10 0.20 0.30
+0.1 0.0 0.0 -2.5 -3.0 -3.5 0.9238795 0.0 0.3826834 0.0 -0.50 0.40 0.50 0.60
+0.0 0.1 0.0 -4.0 -3.0 -2.0 0.7071068 0.7071068 0.0 0.0 1.25 -0.20 -0.10 0.00

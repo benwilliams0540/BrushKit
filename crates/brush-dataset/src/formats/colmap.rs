@@ -296,6 +296,7 @@ async fn load_dataset_inner(
 
     Ok(DatasetLoadResult {
         init_splat,
+        init_splat_path: None,
         dataset,
         warnings,
     })

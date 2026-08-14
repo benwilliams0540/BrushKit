@@ -5,6 +5,40 @@ use glam::Vec3;
 
 use crate::config::TrainStreamConfig;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TelemetryBoundary {
+    DatasetLoadStarted,
+    DatasetLoadFinished,
+    TrainerInitializationStarted,
+    TrainerInitializationFinished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitializerRoute {
+    Random,
+    DatasetSparse,
+    ImplicitPly,
+    ExplicitPly,
+    ExplicitStrong,
+}
+
+#[derive(Clone, Debug)]
+pub struct InitializerReport {
+    pub route: InitializerRoute,
+    pub path: Option<PathBuf>,
+    pub primitive_count: u32,
+    pub fields_consumed: u32,
+    pub rejected_count: u32,
+    pub supplied_sh_degree: Option<u32>,
+    pub configured_sh_degree: u32,
+}
+
+pub const INITIALIZER_FIELD_MEANS: u32 = 1 << 0;
+pub const INITIALIZER_FIELD_ROTATIONS: u32 = 1 << 1;
+pub const INITIALIZER_FIELD_LOG_SCALES: u32 = 1 << 2;
+pub const INITIALIZER_FIELD_OPACITY: u32 = 1 << 3;
+pub const INITIALIZER_FIELD_SH: u32 = 1 << 4;
+
 pub enum TrainMessage {
     /// Training configuration - sent at the start of training.
     TrainConfig {
@@ -19,6 +53,13 @@ pub enum TrainMessage {
     TrainStep {
         iter: u32,
         total_elapsed: web_time::Duration,
+        step_duration: web_time::Duration,
+        data_wait_duration: web_time::Duration,
+        forward_duration: web_time::Duration,
+        loss_duration: web_time::Duration,
+        backward_duration: web_time::Duration,
+        optimizer_duration: web_time::Duration,
+        live_splat_count: u32,
         /// If in LOD phase: `(current_lod_1_based, total_lod_levels)`.
         lod_progress: Option<(u32, u32)>,
     },
@@ -27,6 +68,18 @@ pub enum TrainMessage {
     RefineStep {
         cur_splat_count: u32,
         iter: u32,
+        num_added: u32,
+        num_split_oversized: u32,
+        num_split_high_grad: u32,
+        num_pruned: u32,
+        num_pruned_non_finite: u32,
+        duration: web_time::Duration,
+    },
+    TelemetryBoundary {
+        boundary: TelemetryBoundary,
+    },
+    Initializer {
+        report: InitializerReport,
     },
     /// Eval was run successfully with these results.
     #[allow(unused)]
@@ -34,6 +87,11 @@ pub enum TrainMessage {
         iter: u32,
         avg_psnr: f32,
         avg_ssim: f32,
+    },
+    /// A checkpoint was exported successfully.
+    #[allow(unused)]
+    CheckpointExportStarted {
+        iter: u32,
     },
     /// A checkpoint was exported successfully.
     #[allow(unused)]

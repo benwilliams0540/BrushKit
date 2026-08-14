@@ -63,6 +63,21 @@ pub struct SceneLoader {
 
 impl SceneLoader {
     pub fn new(scene: &Scene, seed: u64, config: &LoadDatasetConfig) -> Self {
+        Self::new_with_mode(scene, seed, config, false)
+    }
+
+    /// Deterministic host ordering uses one producer task so async completion
+    /// order cannot reshuffle otherwise seeded samples.
+    pub fn new_deterministic(scene: &Scene, seed: u64, config: &LoadDatasetConfig) -> Self {
+        Self::new_with_mode(scene, seed, config, true)
+    }
+
+    fn new_with_mode(
+        scene: &Scene,
+        seed: u64,
+        config: &LoadDatasetConfig,
+        deterministic: bool,
+    ) -> Self {
         // Prefetch buffer: at most 4 batches ahead of the trainer.
         // Two tasks per actor share this buffer so one task's I/O can
         // overlap with the other's decode + GPU upload.
@@ -71,12 +86,12 @@ impl SceneLoader {
         // Fan out only as many loaders as we have real parallelism.
         // Wasm shares one JS event loop, so extra actors just add
         // contention without overlapping I/O.
-        let n_actors = if cfg!(target_family = "wasm") {
+        let n_actors = if deterministic || cfg!(target_family = "wasm") {
             1
         } else {
             std::thread::available_parallelism().map_or(8, |p| p.get())
         };
-        const TASKS_PER_ACTOR: usize = 2;
+        let tasks_per_actor = if deterministic { 1 } else { 2 };
 
         let views = scene.views.clone();
         let cache = Arc::new(Mutex::new(BatchCache::new(
@@ -88,7 +103,7 @@ impl SceneLoader {
         let actors: Vec<Actor> = (0..n_actors)
             .map(|i| {
                 let actor = Actor::new(&format!("dataloader-{i}"));
-                for _ in 0..TASKS_PER_ACTOR {
+                for _ in 0..tasks_per_actor {
                     let views = views.clone();
                     let cache = cache.clone();
                     let tx = tx.clone();

@@ -4,7 +4,7 @@ use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
     msg::{RefineStats, TrainStepStats},
-    multinomial::multinomial_sample,
+    multinomial::{multinomial_sample, multinomial_sample_with_rng},
     quat_vec::quaternion_vec_multiply,
     splat_init::bounds_from_pos,
     stats::RefineRecord,
@@ -30,7 +30,9 @@ use burn::{
 
 use burn_cubecl::cubecl::Runtime;
 use hashbrown::{HashMap, HashSet};
+use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
+use web_time::Instant;
 
 pub const BOUND_PERCENTILE: f32 = 0.8;
 
@@ -63,6 +65,9 @@ pub struct SplatTrainer {
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
     view_cams: Vec<(glam::Vec3, f32)>,
+    /// Present only for callers that explicitly request deterministic host RNG.
+    /// Legacy callers continue to use thread-local entropy exactly as before.
+    deterministic_rng: Option<rand::rngs::StdRng>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -143,6 +148,7 @@ impl SplatTrainer {
             step_count: 0,
             max_sh_degree: 0,
             view_cams: Vec::new(),
+            deterministic_rng: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -152,6 +158,10 @@ impl SplatTrainer {
     /// the Mip-Splatting 3D filter (gated on `config.min_scale_factor > 0`).
     pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
         self.view_cams = view_cams;
+    }
+
+    pub fn set_deterministic_seed(&mut self, seed: Option<u64>) {
+        self.deterministic_rng = seed.map(rand::rngs::StdRng::seed_from_u64);
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
@@ -180,17 +190,34 @@ impl SplatTrainer {
         let img_size = glam::uvec2(img_w as u32, img_h as u32);
         let base = &self.config.background_color;
         let base_bg = glam::Vec3::new(base[0], base[1], base[2]);
-        let background = sample_background_color(base_bg, self.config.background_noise_strength);
+        let background = match self.deterministic_rng.as_mut() {
+            Some(rng) => sample_background_color_with_rng(
+                base_bg,
+                self.config.background_noise_strength,
+                rng,
+            ),
+            None => sample_background_color(base_bg, self.config.background_noise_strength),
+        };
 
         let median_scale = self.bounds.median_size();
 
-        let (mut grads, visible, num_visible, loss_inner) = {
+        let (
+            mut grads,
+            visible,
+            num_visible,
+            loss_inner,
+            forward_duration,
+            loss_duration,
+            backward_duration,
+        ) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
+            let forward_start = Instant::now();
             let diff_out = render_splats(render_input, &camera, img_size, background)
                 .instrument(trace_span!("Forward"))
                 .await;
+            let forward_duration = forward_start.elapsed();
 
             let pred_image = diff_out.img;
             let refine_weight_holder = diff_out.refine_weight_holder;
@@ -205,6 +232,7 @@ impl SplatTrainer {
             // a = 1 would pull predicted alpha to fully opaque); we feed
             // `pred` with 4 channels and the kernel's `c == 3` workgroup
             // emits `|pred.a - gt.a|` into the alpha channel.
+            let loss_start = Instant::now();
             let masked_alpha = batch.alpha_mode == AlphaMode::Masked;
             let (l1_w, ssim_w) = if self.ssim_enabled {
                 (1.0 - self.config.ssim_weight, -self.config.ssim_weight)
@@ -256,7 +284,10 @@ impl SplatTrainer {
             // Strip the autodiff graph off the loss so consumers can read the
             // scalar later without keeping the backward pass alive.
             let loss_inner = loss.clone().inner();
+            let loss_duration = loss_start.elapsed();
+            let backward_start = Instant::now();
             let mut grads = splats.bwd_validate(loss).await;
+            let backward_duration = backward_start.elapsed();
 
             trace_span!("Housekeeping").in_scope(|| {
                 // Refine state accumulates on the inner (non-autodiff) device
@@ -278,7 +309,15 @@ impl SplatTrainer {
                 record.gather_stats(detach_autodiff(refine_weight), visible.clone(), max_radius);
             });
 
-            (grads, visible, diff_out.num_visible, loss_inner)
+            (
+                grads,
+                visible,
+                diff_out.num_visible,
+                loss_inner,
+                forward_duration,
+                loss_duration,
+                backward_duration,
+            )
         };
 
         // OptimizerAdaptor strips autodiff before calling SimpleOptimizer::step,
@@ -344,6 +383,7 @@ impl SplatTrainer {
             *optimizer = create_optimizer_from_config().load_record(record);
         }
 
+        let optimizer_start = Instant::now();
         splats = trace_span!("Optimizer step").in_scope(|| {
             splats = trace_span!("Transforms step").in_scope(|| {
                 let grad_transforms =
@@ -362,6 +402,7 @@ impl SplatTrainer {
             });
             splats
         });
+        let optimizer_duration = optimizer_start.elapsed();
 
         // Add random noise. Only do this in the growth phase, otherwise
         // let the splats settle in without noise, not much point in exploring regions anymore.
@@ -405,6 +446,10 @@ impl SplatTrainer {
             lr_scale: self.config.lr_scale,
             lr_coeffs: self.config.lr_coeffs_dc,
             lr_opac: self.config.lr_opac,
+            forward_duration,
+            loss_duration,
+            backward_duration,
+            optimizer_duration,
             loss: loss_inner,
         };
 
@@ -535,7 +580,10 @@ impl SplatTrainer {
                 .expect("Failed to get weights")
                 .into_vec::<f32>()
                 .expect("Failed to read weights");
-            let resampled_inds = multinomial_sample(&resampled_weights, pruned_count);
+            let resampled_inds = match self.deterministic_rng.as_mut() {
+                Some(rng) => multinomial_sample_with_rng(&resampled_weights, pruned_count, rng),
+                None => multinomial_sample(&resampled_weights, pruned_count),
+            };
             split_inds.extend(resampled_inds);
         }
 
@@ -604,7 +652,10 @@ impl SplatTrainer {
                     .expect("Failed to get weights")
                     .into_vec::<f32>()
                     .expect("Failed to read weights");
-                let growth_inds = multinomial_sample(&weights, grow_count);
+                let growth_inds = match self.deterministic_rng.as_mut() {
+                    Some(rng) => multinomial_sample_with_rng(&weights, grow_count, rng),
+                    None => multinomial_sample(&weights, grow_count),
+                };
                 split_inds.extend(growth_inds);
             }
         }
@@ -905,8 +956,19 @@ fn sample_background_color(base: glam::Vec3, strength: f32) -> glam::Vec3 {
     if strength <= 0.0 {
         return base.clamp(glam::Vec3::ZERO, glam::Vec3::ONE);
     }
-    use rand::RngExt as _;
     let mut rng = rand::rng();
+    sample_background_color_with_rng(base, strength, &mut rng)
+}
+
+fn sample_background_color_with_rng<R: rand::Rng + ?Sized>(
+    base: glam::Vec3,
+    strength: f32,
+    rng: &mut R,
+) -> glam::Vec3 {
+    if strength <= 0.0 {
+        return base.clamp(glam::Vec3::ZERO, glam::Vec3::ONE);
+    }
+    use rand::RngExt as _;
     let noise = glam::Vec3::new(
         rng.random_range(-strength..strength),
         rng.random_range(-strength..strength),

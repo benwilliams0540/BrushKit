@@ -1,7 +1,15 @@
 pub(crate) fn multinomial_sample(weights: &[f32], n: u32) -> Vec<i32> {
     let mut rng = rand::rng();
+    multinomial_sample_with_rng(weights, n, &mut rng)
+}
+
+pub(crate) fn multinomial_sample_with_rng<R: rand::Rng + ?Sized>(
+    weights: &[f32],
+    n: u32,
+    rng: &mut R,
+) -> Vec<i32> {
     rand::seq::index::sample_weighted(
-        &mut rng,
+        rng,
         weights.len(),
         |i| {
             if weights[i].is_finite() && weights[i] >= 0.0 {
@@ -28,6 +36,7 @@ pub(crate) fn multinomial_sample(weights: &[f32], n: u32) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[wasm_bindgen_test(unsupported = test)]
@@ -76,5 +85,16 @@ mod tests {
 
         // Function returns empty vector when it cannot sample any valid indices
         assert_eq!(result.len(), 0);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn seeded_multinomial_sampling_is_reproducible() {
+        let weights = vec![0.1, 0.3, 0.4, 0.2, 0.8, 0.6];
+        let mut first = rand::rngs::StdRng::seed_from_u64(0x0123_4567_89ab_cdef);
+        let mut second = rand::rngs::StdRng::seed_from_u64(0x0123_4567_89ab_cdef);
+        assert_eq!(
+            multinomial_sample_with_rng(&weights, 4, &mut first),
+            multinomial_sample_with_rng(&weights, 4, &mut second)
+        );
     }
 }

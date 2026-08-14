@@ -9,6 +9,7 @@ license.workspace = true
 debug-validation = ["brush-render-bwd/debug-validation"]
 
 [dependencies]
+web-time.workspace = true
 brush-render.path = "../brush-render"
 brush-dataset.path = "../brush-dataset"
 brush-render-bwd.path = "../brush-render-bwd"

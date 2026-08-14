@@ -1,4 +1,5 @@
 use burn::tensor::Tensor;
+use web_time::Duration;
 
 #[derive(Clone)]
 pub struct RefineStats {
@@ -21,6 +22,15 @@ pub struct TrainStepStats {
     pub lr_scale: f64,
     pub lr_coeffs: f64,
     pub lr_opac: f64,
+    /// Host-observed duration around render submission/completion as already
+    /// awaited by the trainer. This does not add synchronization.
+    pub forward_duration: Duration,
+    /// Host-observed duration for loss and SSIM graph construction.
+    pub loss_duration: Duration,
+    /// Host-observed duration around the existing backward await.
+    pub backward_duration: Duration,
+    /// Host-observed duration for optimizer command construction.
+    pub optimizer_duration: Duration,
     // Non-autodiff inner tensor; consumers read the scalar lazily so disabled
     // logging doesn't force a GPU readback.
     pub loss: Tensor<1>,

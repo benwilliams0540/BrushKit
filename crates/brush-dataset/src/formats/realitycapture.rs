@@ -156,6 +156,7 @@ async fn read_dataset_inner(
 
     Ok(DatasetLoadResult {
         init_splat: None,
+        init_splat_path: None,
         dataset: Dataset::from_views(train_views, eval_views),
         warnings,
     })

@@ -933,6 +933,8 @@ name = "brush-c"
 version = "0.3.0"
 dependencies = [
  "brush-process",
+ "brush-render",
+ "brush-serde",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1216,6 +1218,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wasm-bindgen-test",
+ "web-time",
 ]
 
 [[package]]

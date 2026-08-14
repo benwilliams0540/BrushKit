@@ -1,14 +1,20 @@
 use crate::{
     Emitter,
     config::TrainStreamConfig,
-    message::{ProcessMessage, TrainMessage},
+    message::{
+        INITIALIZER_FIELD_LOG_SCALES, INITIALIZER_FIELD_MEANS, INITIALIZER_FIELD_OPACITY,
+        INITIALIZER_FIELD_ROTATIONS, INITIALIZER_FIELD_SH, InitializerReport, InitializerRoute,
+        ProcessMessage, TelemetryBoundary, TrainMessage,
+    },
     slot::SlotSender,
     wait_for_device,
 };
 use anyhow::Context;
 use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
+use brush_render::sh::sh_coeffs_for_degree;
 use brush_rerun::visualize_tools::VisualizeTools;
+use brush_serde::SplatData;
 use brush_train::{
     RandomSplatsConfig, create_random_splats,
     eval::eval_stats,
@@ -57,12 +63,40 @@ pub(crate) async fn train_stream(
     // burn-dispatch's `from_inner` checkpointing bug.
     let device: burn::tensor::Device = wgpu_device.clone().into();
     device.seed(process_config.seed);
-    let mut rng = rand::rngs::StdRng::from_seed([process_config.seed as u8; 32]);
+    let mut rng = match train_stream_config.host_runtime.deterministic_seed {
+        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+        None => rand::rngs::StdRng::from_seed([process_config.seed as u8; 32]),
+    };
 
     log::info!("Loading dataset");
-    let load_result = load_dataset(vfs.clone(), &train_stream_config.load_config)
-        .instrument(trace_span!("Load dataset"))
-        .await?;
+    if train_stream_config.host_runtime.phase0_telemetry {
+        emitter
+            .emit(ProcessMessage::TrainMessage(
+                TrainMessage::TelemetryBoundary {
+                    boundary: TelemetryBoundary::DatasetLoadStarted,
+                },
+            ))
+            .await;
+    }
+    let load_result = load_dataset(
+        vfs.clone(),
+        &train_stream_config.load_config,
+        train_stream_config
+            .host_runtime
+            .explicit_initializer_path
+            .as_deref(),
+    )
+    .instrument(trace_span!("Load dataset"))
+    .await?;
+    if train_stream_config.host_runtime.phase0_telemetry {
+        emitter
+            .emit(ProcessMessage::TrainMessage(
+                TrainMessage::TelemetryBoundary {
+                    boundary: TelemetryBoundary::DatasetLoadFinished,
+                },
+            ))
+            .await;
+    }
 
     // Emit any warnings from dataset loading.
     for warning in load_result.warnings {
@@ -97,6 +131,15 @@ pub(crate) async fn train_stream(
 
     log::info!("Loading initial splats if any.");
     let estimated_up = dataset.estimate_up();
+    if train_stream_config.host_runtime.phase0_telemetry {
+        emitter
+            .emit(ProcessMessage::TrainMessage(
+                TrainMessage::TelemetryBoundary {
+                    boundary: TelemetryBoundary::TrainerInitializationStarted,
+                },
+            ))
+            .await;
+    }
 
     // Convert SplatData to Splats using KNN initialization
     let (up_axis, init_splats) = if let Some(msg) = load_result.init_splat {
@@ -108,7 +151,23 @@ pub(crate) async fn train_stream(
             .unwrap_or(SplatRenderMode::Default);
         let max_splats = train_stream_config.train_config.max_splats as usize;
         let original = msg.data.num_splats();
-        let data = msg.data.subsample(max_splats);
+        let strong_report = train_stream_config
+            .host_runtime
+            .require_strong_initializer
+            .then(|| {
+                validate_strong_initializer(
+                    &msg.data,
+                    load_result.init_splat_path.clone(),
+                    max_splats,
+                    train_stream_config.model_config.sh_degree,
+                )
+            })
+            .transpose()?;
+        let data = if strong_report.is_some() {
+            msg.data
+        } else {
+            msg.data.subsample(max_splats)
+        };
         if data.num_splats() < original {
             emitter
                 .emit(ProcessMessage::Warning {
@@ -120,8 +179,37 @@ pub(crate) async fn train_stream(
                 .await;
         }
         let splats = to_init_splats(data, render_mode, &device);
+        if train_stream_config.host_runtime.phase0_telemetry {
+            let report = strong_report.unwrap_or_else(|| InitializerReport {
+                route: if train_stream_config
+                    .host_runtime
+                    .explicit_initializer_path
+                    .is_some()
+                {
+                    InitializerRoute::ExplicitPly
+                } else if load_result.init_splat_path.is_some() {
+                    InitializerRoute::ImplicitPly
+                } else {
+                    InitializerRoute::DatasetSparse
+                },
+                path: load_result.init_splat_path.clone(),
+                primitive_count: splats.num_splats(),
+                fields_consumed: 0,
+                rejected_count: original.saturating_sub(splats.num_splats() as usize) as u32,
+                supplied_sh_degree: Some(splats.sh_degree()),
+                configured_sh_degree: train_stream_config.model_config.sh_degree,
+            });
+            emitter
+                .emit(ProcessMessage::TrainMessage(TrainMessage::Initializer {
+                    report,
+                }))
+                .await;
+        }
         (msg.meta.up_axis, splats)
     } else {
+        if train_stream_config.host_runtime.require_strong_initializer {
+            anyhow::bail!("required strong initializer was not found");
+        }
         // Default: just use random splats
         let render_mode = train_stream_config
             .train_config
@@ -139,6 +227,21 @@ pub(crate) async fn train_stream(
             render_mode,
             &device,
         );
+        if train_stream_config.host_runtime.phase0_telemetry {
+            emitter
+                .emit(ProcessMessage::TrainMessage(TrainMessage::Initializer {
+                    report: InitializerReport {
+                        route: InitializerRoute::Random,
+                        path: None,
+                        primitive_count: splats.num_splats(),
+                        fields_consumed: 0,
+                        rejected_count: 0,
+                        supplied_sh_degree: None,
+                        configured_sh_degree: train_stream_config.model_config.sh_degree,
+                    },
+                }))
+                .await;
+        }
         (None, splats)
     };
 
@@ -171,7 +274,22 @@ pub(crate) async fn train_stream(
     let mut eval_scene = dataset.eval;
 
     let mut train_duration = Duration::from_secs(0);
-    let mut dataloader = SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config);
+    let dataloader_seed = train_stream_config
+        .host_runtime
+        .deterministic_seed
+        .unwrap_or(42);
+    let make_dataloader = |scene: &Scene| {
+        if train_stream_config
+            .host_runtime
+            .deterministic_seed
+            .is_some()
+        {
+            SceneLoader::new_deterministic(scene, dataloader_seed, &train_stream_config.load_config)
+        } else {
+            SceneLoader::new(scene, dataloader_seed, &train_stream_config.load_config)
+        }
+    };
+    let mut dataloader = make_dataloader(&dataset.train);
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
 
     // Per-train-view (world center, focal-px at native res) for the
@@ -185,6 +303,16 @@ pub(crate) async fn train_stream(
 
     let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
     trainer.set_view_cams(view_cams.clone());
+    trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
+    if train_stream_config.host_runtime.phase0_telemetry {
+        emitter
+            .emit(ProcessMessage::TrainMessage(
+                TrainMessage::TelemetryBoundary {
+                    boundary: TelemetryBoundary::TrainerInitializationFinished,
+                },
+            ))
+            .await;
+    }
 
     // Get the dataset name from the base path (if available) for interpolation.
     let dataset_name = vfs
@@ -235,6 +363,13 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
+                if train_stream_config.host_runtime.phase0_telemetry {
+                    emitter
+                        .emit(ProcessMessage::TrainMessage(
+                            TrainMessage::CheckpointExportStarted { iter: exp_iter },
+                        ))
+                        .await;
+                }
                 let res =
                     export_checkpoint(splats.clone(), &export_path, &name, exp_iter, exp_total)
                         .await
@@ -280,14 +415,15 @@ pub(crate) async fn train_stream(
             let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
             dataloader = if lod_img_pct < 100 {
                 let lod_scene = dataset.train.clone().with_image_scale(cumulative_scale);
-                SceneLoader::new(&lod_scene, 42, &train_stream_config.load_config)
+                make_dataloader(&lod_scene)
             } else {
-                SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config)
+                make_dataloader(&dataset.train)
             };
 
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
             trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
             trainer.set_view_cams(view_cams.clone());
+            trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -297,10 +433,12 @@ pub(crate) async fn train_stream(
 
         let step_time = Instant::now();
 
+        let data_wait_start = Instant::now();
         let batch = dataloader
             .next_batch()
             .instrument(trace_span!("Wait for next data batch"))
             .await;
+        let data_wait_duration = data_wait_start.elapsed();
 
         // Lift splats onto the autodiff graph for this step, run training,
         // then strip back to inner so the viewer slot sees plain splats.
@@ -323,10 +461,10 @@ pub(crate) async fn train_stream(
         let phase_progress = (phase_iter as f32 / phase_total as f32).clamp(0.0, 1.0);
 
         let refine_start = Instant::now();
-        let refine = if phase_iter > 0
+        let did_refine = phase_iter > 0
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
-            && phase_progress <= 0.95
-        {
+            && phase_progress <= 0.95;
+        let refine = if did_refine {
             let (new_splats, refine_stats) = trainer.refine(iter, splats).await;
             splats = new_splats;
             slot.set(0, splats.clone());
@@ -396,6 +534,13 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
+                if train_stream_config.host_runtime.phase0_telemetry {
+                    emitter
+                        .emit(ProcessMessage::TrainMessage(
+                            TrainMessage::CheckpointExportStarted { iter: exp_iter },
+                        ))
+                        .await;
+                }
                 let res =
                     export_checkpoint(splats.clone(), &export_path, &name, exp_iter, exp_total)
                         .await
@@ -467,17 +612,31 @@ pub(crate) async fn train_stream(
             }
         }
 
-        if refine.num_added > 0 {
+        if refine.num_added > 0 || (did_refine && train_stream_config.host_runtime.phase0_telemetry)
+        {
             emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::RefineStep {
                     cur_splat_count: refine.total_splats,
                     iter,
+                    num_added: refine.num_added,
+                    num_split_oversized: refine.num_split_oversized,
+                    num_split_high_grad: refine.num_split_high_grad,
+                    num_pruned: refine.num_pruned,
+                    num_pruned_non_finite: refine.num_pruned_non_finite,
+                    duration: refine_dur,
                 }))
                 .await;
         }
 
         const UPDATE_EVERY: u32 = 5;
-        if iter % UPDATE_EVERY == 0 || is_last_step {
+        let phase0_sample = iter == 1
+            || matches!(iter, 50 | 51 | 100 | 101)
+            || iter.is_multiple_of(10)
+            || is_last_step;
+        if iter % UPDATE_EVERY == 0
+            || is_last_step
+            || (train_stream_config.host_runtime.phase0_telemetry && phase0_sample)
+        {
             emitter
                 .emit(ProcessMessage::SplatsUpdated {
                     up_axis: None,
@@ -498,6 +657,13 @@ pub(crate) async fn train_stream(
                 .emit(ProcessMessage::TrainMessage(TrainMessage::TrainStep {
                     iter,
                     total_elapsed: train_duration,
+                    step_duration: step_dur,
+                    data_wait_duration,
+                    forward_duration: stats.forward_duration,
+                    loss_duration: stats.loss_duration,
+                    backward_duration: stats.backward_duration,
+                    optimizer_duration: stats.optimizer_duration,
+                    live_splat_count: refine.total_splats,
                     lod_progress,
                 }))
                 .await;
@@ -511,6 +677,195 @@ pub(crate) async fn train_stream(
         .await;
 
     Ok(())
+}
+
+fn validate_strong_initializer(
+    data: &SplatData,
+    path: Option<PathBuf>,
+    max_splats: usize,
+    configured_sh_degree: u32,
+) -> anyhow::Result<InitializerReport> {
+    let count = data.num_splats();
+    anyhow::ensure!(
+        count > 0,
+        "required strong initializer contains no primitives"
+    );
+    anyhow::ensure!(
+        count <= max_splats,
+        "required strong initializer contains {count} primitives, exceeding max_splats ({max_splats})"
+    );
+    anyhow::ensure!(
+        data.means.len() == count * 3,
+        "required strong initializer means have an invalid element count"
+    );
+
+    let rotations = data
+        .rotations
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("required strong initializer is missing rotations"))?;
+    let log_scales = data.log_scales.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("required strong initializer is missing anisotropic log scales")
+    })?;
+    let opacities = data
+        .raw_opacities
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("required strong initializer is missing opacity"))?;
+    let sh = data.sh_coeffs.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("required strong initializer is missing DC/RGB coefficients")
+    })?;
+
+    anyhow::ensure!(
+        rotations.len() == count * 4,
+        "required strong initializer rotations have an invalid element count"
+    );
+    anyhow::ensure!(
+        log_scales.len() == count * 3,
+        "required strong initializer log scales have an invalid element count"
+    );
+    anyhow::ensure!(
+        opacities.len() == count,
+        "required strong initializer opacity has an invalid element count"
+    );
+    anyhow::ensure!(
+        sh.len().is_multiple_of(count * 3),
+        "required strong initializer SH coefficients have an invalid element count"
+    );
+
+    let coefficients_per_channel = sh.len() / (count * 3);
+    let supplied_sh_degree = (0..=4)
+        .find(|degree| sh_coeffs_for_degree(*degree) as usize == coefficients_per_channel)
+        .ok_or_else(|| anyhow::anyhow!(
+            "required strong initializer has incompatible SH coefficient count ({coefficients_per_channel} per channel)"
+        ))?;
+    anyhow::ensure!(
+        supplied_sh_degree <= configured_sh_degree,
+        "required strong initializer SH degree {supplied_sh_degree} exceeds configured degree {configured_sh_degree}; truncation is not permitted"
+    );
+
+    let non_finite = data
+        .means
+        .iter()
+        .chain(rotations)
+        .chain(log_scales)
+        .chain(opacities)
+        .chain(sh)
+        .filter(|value| !value.is_finite())
+        .count();
+    anyhow::ensure!(
+        non_finite == 0,
+        "required strong initializer contains {non_finite} non-finite values"
+    );
+
+    Ok(InitializerReport {
+        route: InitializerRoute::ExplicitStrong,
+        path,
+        primitive_count: count as u32,
+        fields_consumed: INITIALIZER_FIELD_MEANS
+            | INITIALIZER_FIELD_ROTATIONS
+            | INITIALIZER_FIELD_LOG_SCALES
+            | INITIALIZER_FIELD_OPACITY
+            | INITIALIZER_FIELD_SH,
+        rejected_count: 0,
+        supplied_sh_degree: Some(supplied_sh_degree),
+        configured_sh_degree,
+    })
+}
+
+#[cfg(test)]
+mod strong_initializer_tests {
+    use super::*;
+
+    fn strong_data(coefficients_per_channel: usize) -> SplatData {
+        SplatData {
+            means: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            rotations: Some(vec![1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5]),
+            log_scales: Some(vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]),
+            sh_coeffs: Some(vec![0.25; 2 * coefficients_per_channel * 3]),
+            raw_opacities: Some(vec![-0.5, 0.5]),
+        }
+    }
+
+    #[test]
+    fn degree_zero_strong_initializer_is_valid_and_preserved_for_degree_three() {
+        let data = strong_data(1);
+        let before_rotations = data.rotations.clone();
+        let before_scales = data.log_scales.clone();
+        let before_sh = data.sh_coeffs.clone();
+        let before_opacity = data.raw_opacities.clone();
+
+        let report =
+            validate_strong_initializer(&data, Some(PathBuf::from("strong-init.ply")), 2, 3)
+                .unwrap();
+
+        assert_eq!(report.primitive_count, 2);
+        assert_eq!(report.supplied_sh_degree, Some(0));
+        assert_eq!(report.configured_sh_degree, 3);
+        assert_eq!(report.rejected_count, 0);
+        assert_eq!(data.rotations, before_rotations);
+        assert_eq!(data.log_scales, before_scales);
+        assert_eq!(data.sh_coeffs, before_sh);
+        assert_eq!(data.raw_opacities, before_opacity);
+    }
+
+    #[test]
+    fn strong_initializer_rejects_truncation_non_finite_and_budget_overflow() {
+        let degree_one = strong_data(4);
+        let error = validate_strong_initializer(&degree_one, None, 2, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("truncation is not permitted"));
+
+        let mut non_finite = strong_data(1);
+        non_finite.log_scales.as_mut().unwrap()[2] = f32::NAN;
+        let error = validate_strong_initializer(&non_finite, None, 2, 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-finite"));
+
+        let error = validate_strong_initializer(&strong_data(1), None, 1, 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeding max_splats"));
+    }
+
+    #[test]
+    fn strong_initializer_requires_every_full_gaussian_field() {
+        let mut data = strong_data(1);
+        data.rotations = None;
+        assert!(
+            validate_strong_initializer(&data, None, 2, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("missing rotations")
+        );
+
+        let mut data = strong_data(1);
+        data.log_scales = None;
+        assert!(
+            validate_strong_initializer(&data, None, 2, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("anisotropic log scales")
+        );
+
+        let mut data = strong_data(1);
+        data.raw_opacities = None;
+        assert!(
+            validate_strong_initializer(&data, None, 2, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("missing opacity")
+        );
+
+        let mut data = strong_data(1);
+        data.sh_coeffs = None;
+        assert!(
+            validate_strong_initializer(&data, None, 2, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("missing DC/RGB")
+        );
+    }
 }
 
 async fn run_eval(

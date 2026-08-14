@@ -5,10 +5,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use brush_c::{
-    ProgressMessage, ProgressMessageKind, TrainExitCode, TrainOptions, brush_job_cancel,
-    brush_job_release, brush_job_wait, brush_train_start, train_and_save,
+    BRUSH_ABI_VERSION_V2, BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2, BrushEventKindV2, BrushEventV2,
+    BrushInitializerRouteV2, BrushNativeIdentityV2, ProgressMessage, ProgressMessageKind,
+    TrainExitCode, TrainOptions, TrainOptionsV2, brush_get_abi_version,
+    brush_get_native_identity_v2, brush_job_cancel, brush_job_release, brush_job_release_v2,
+    brush_job_retain_v2, brush_job_wait, brush_job_wait_v2, brush_train_start,
+    brush_train_start_v2, train_and_save,
 };
 
 #[repr(C)]
@@ -22,8 +27,8 @@ struct CallbackState {
 }
 
 impl CallbackState {
-    fn new() -> CallbackState {
-        CallbackState {
+    fn new() -> Self {
+        Self {
             call_count: AtomicUsize::new(0),
             training_count: AtomicUsize::new(0),
             checkpoint_count: AtomicUsize::new(0),
@@ -105,6 +110,464 @@ fn output_files(output_path: &str) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .collect()
+}
+
+#[derive(Default)]
+struct V2CallbackState {
+    events: Mutex<Vec<(BrushEventV2, Option<String>)>>,
+}
+
+extern "C" fn test_v2_callback(event: BrushEventV2, user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: tests keep the callback state alive through wait/release.
+    let state = unsafe { &*user_data.cast::<V2CallbackState>() };
+    let text = (!event.text.is_null()).then(|| {
+        // SAFETY: V2 text is callback-scoped and copied before returning.
+        unsafe { CStr::from_ptr(event.text) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    state.events.lock().unwrap().push((event, text));
+}
+
+fn v2_options(
+    output_path: &CString,
+    export_name: &CString,
+    initializer_path: &CString,
+    instrumentation_level: u32,
+) -> TrainOptionsV2 {
+    TrainOptionsV2 {
+        struct_size: std::mem::size_of::<TrainOptionsV2>() as u32,
+        abi_version: BRUSH_ABI_VERSION_V2,
+        seed: 0x0123_4567_89ab_cdef,
+        render_mode: 1,
+        sh_degree: 3,
+        sh_policy: 0,
+        total_train_steps: 10,
+        refine_every: 200,
+        max_resolution: 50,
+        max_splats: 1000,
+        export_every: 10,
+        output_path: output_path.as_ptr(),
+        export_name: export_name.as_ptr(),
+        initializer_path: initializer_path.as_ptr(),
+        initializer_required: 1,
+        instrumentation_level,
+    }
+}
+
+#[test]
+fn test_v2_abi_identity_is_explicit() {
+    assert_eq!(brush_get_abi_version(), 2);
+    let mut identity = BrushNativeIdentityV2 {
+        struct_size: 0,
+        abi_version: 0,
+        build_revision: std::ptr::null(),
+        crate_version: std::ptr::null(),
+        graphics_backend: std::ptr::null(),
+        adapter_name: std::ptr::null(),
+        adapter_identity_available: true,
+    };
+    // SAFETY: identity is exact writable V2 storage.
+    assert!(unsafe {
+        brush_get_native_identity_v2(
+            &mut identity,
+            std::mem::size_of::<BrushNativeIdentityV2>() as u32,
+        )
+    });
+    assert_eq!(identity.abi_version, 2);
+    assert!(!identity.build_revision.is_null());
+    assert!(!identity.crate_version.is_null());
+    assert!(!identity.graphics_backend.is_null());
+    assert!(!identity.adapter_name.is_null());
+    assert!(!identity.adapter_identity_available);
+}
+
+#[test]
+fn test_v2_rejects_wrong_abi_synchronously_with_detail() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let mut options = v2_options(&output_path, &export_name, &initializer, 1);
+    options.abi_version = 99;
+    let mut state = V2CallbackState::default();
+    // SAFETY: pointers are valid for this synchronous validation call.
+    let job = unsafe {
+        brush_train_start_v2(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert!(job.is_null());
+    let events = state.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0.kind, BrushEventKindV2::Terminal);
+    assert!(events[0].1.as_deref().unwrap().contains("ABI version"));
+}
+
+#[test]
+fn test_v2_strong_initializer_and_phase0_events() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_v2_strong_")
+        .tempdir()
+        .unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let options = v2_options(&output_path, &export_name, &initializer, 1);
+    let mut state = V2CallbackState::default();
+
+    // SAFETY: all callback-owned data remains alive through wait and release.
+    let job = unsafe {
+        brush_train_start_v2(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert!(!job.is_null());
+    // SAFETY: retain produces a separately releasable handle.
+    let retained = unsafe { brush_job_retain_v2(job) };
+    assert!(!retained.is_null());
+    let retained_address = retained as usize;
+    let waiter = std::thread::spawn(move || {
+        // SAFETY: retained handle remains owned by this thread until release.
+        let retained = retained_address as *mut brush_c::BrushJobV2;
+        // SAFETY: retained is the live handle transferred to this thread.
+        let status = unsafe { brush_job_wait_v2(retained) };
+        // SAFETY: matching release for retain.
+        unsafe { brush_job_release_v2(retained) };
+        status
+    });
+    // SAFETY: original handle remains live.
+    let status = unsafe { brush_job_wait_v2(job) };
+    assert_eq!(waiter.join().unwrap(), TrainExitCode::Success);
+    // SAFETY: matching release for start.
+    unsafe { brush_job_release_v2(job) };
+    assert_eq!(
+        status,
+        TrainExitCode::Success,
+        "Fast Preview evidence run failed"
+    );
+
+    let events = state.events.lock().unwrap();
+    let kinds: Vec<_> = events.iter().map(|event| event.0.kind).collect();
+    assert_eq!(kinds.first(), Some(&BrushEventKindV2::Capabilities));
+    assert_eq!(kinds.get(1), Some(&BrushEventKindV2::Configuration));
+    assert_eq!(kinds.last(), Some(&BrushEventKindV2::Terminal));
+    assert!(events[0].0.capability_flags & BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2 != 0);
+
+    let configuration = events
+        .iter()
+        .find(|event| event.0.kind == BrushEventKindV2::Configuration)
+        .unwrap()
+        .0;
+    assert_eq!(configuration.seed, options.seed);
+    assert_eq!(configuration.render_mode, 1);
+    assert_eq!(configuration.iteration, 10);
+    assert_eq!(configuration.refine_every, 200);
+    assert_eq!(configuration.max_resolution, 50);
+    assert_eq!(configuration.max_splats, 1000);
+    assert_eq!(configuration.export_every, 10);
+    assert_eq!(configuration.configured_sh_degree, 3);
+
+    let initializer_event = events
+        .iter()
+        .find(|event| event.0.kind == BrushEventKindV2::Initializer)
+        .unwrap();
+    assert_eq!(
+        initializer_event.0.initializer_route,
+        BrushInitializerRouteV2::ExplicitStrong
+    );
+    assert_eq!(initializer_event.0.primitive_count, 3);
+    assert_eq!(initializer_event.0.fields_consumed, 0b1_1111);
+    assert_eq!(initializer_event.0.rejected_count, 0);
+    assert_eq!(initializer_event.0.supplied_sh_degree, 0);
+    assert_eq!(initializer_event.0.configured_sh_degree, 3);
+    assert_eq!(initializer_event.1.as_deref(), Some("strong-init.ply"));
+
+    let step_iterations: Vec<_> = events
+        .iter()
+        .filter(|event| event.0.kind == BrushEventKindV2::Step)
+        .map(|event| event.0.iteration)
+        .collect();
+    assert!(step_iterations.contains(&1));
+    assert!(step_iterations.contains(&10));
+    assert!(events.iter().any(|event| {
+        event.0.kind == BrushEventKindV2::CheckpointExportStarted && event.0.iteration == 10
+    }));
+    assert!(events.iter().any(|event| {
+        event.0.kind == BrushEventKindV2::CheckpointExported && event.0.iteration == 10
+    }));
+    let terminal = events.last().unwrap().0;
+    assert_eq!(terminal.initial_primitive_count, 3);
+    assert_eq!(terminal.final_primitive_count, 3);
+}
+
+#[test]
+fn test_v2_required_strong_initializer_cannot_fall_back() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    // The legacy fixture is positions/color only and lacks rotation/scale.
+    let initializer = CString::new("init.ply").unwrap();
+    let options = v2_options(&output_path, &export_name, &initializer, 1);
+    let mut state = V2CallbackState::default();
+    // SAFETY: callback state remains alive through completion.
+    let status = unsafe {
+        brush_c::train_and_save_v2(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert_eq!(status, TrainExitCode::Error);
+    let events = state.events.lock().unwrap();
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal.0.kind, BrushEventKindV2::Terminal);
+    assert!(terminal.1.as_deref().unwrap().contains("missing rotations"));
+    assert!(output_files(temp_dir.path().to_str().unwrap()).is_empty());
+}
+
+#[test]
+fn test_v2_refinement_counts_are_coherent() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_v2_refine_")
+        .tempdir()
+        .unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let mut options = v2_options(&output_path, &export_name, &initializer, 1);
+    options.refine_every = 5;
+    let mut state = V2CallbackState::default();
+
+    // SAFETY: callback state and all option strings outlive the blocking call.
+    let status = unsafe {
+        brush_c::train_and_save_v2(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert_eq!(
+        status,
+        TrainExitCode::Success,
+        "Fast Preview evidence run failed"
+    );
+
+    let events = state.events.lock().unwrap();
+    let refinements: Vec<_> = events
+        .iter()
+        .filter(|event| event.0.kind == BrushEventKindV2::Refinement)
+        .map(|event| event.0)
+        .collect();
+    assert_eq!(refinements.len(), 1);
+    let refinement = refinements[0];
+    assert_eq!(refinement.split_count, refinement.added_count);
+    assert_eq!(refinement.clone_count, 0);
+    assert!(refinement.split_oversized_count <= refinement.split_count);
+    assert!(refinement.split_high_gradient_count <= refinement.split_count);
+    assert!(refinement.pruned_non_finite_count <= refinement.pruned_count);
+    assert_eq!(
+        refinement.net_growth,
+        i64::from(refinement.added_count) - i64::from(refinement.pruned_count)
+    );
+
+    let terminal = events.last().unwrap().0;
+    let cumulative_net_growth: i64 = refinements.iter().map(|event| event.net_growth).sum();
+    assert_eq!(
+        i64::from(terminal.final_primitive_count),
+        i64::from(terminal.initial_primitive_count) + cumulative_net_growth
+    );
+}
+
+struct Phase0RunEvidence {
+    elapsed: Duration,
+    output: Vec<u8>,
+    final_count: u32,
+}
+
+fn run_phase0_evidence(instrumentation_level: u32, total_steps: u32) -> Phase0RunEvidence {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_v2_phase0_evidence_")
+        .tempdir()
+        .unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let mut options = v2_options(
+        &output_path,
+        &export_name,
+        &initializer,
+        instrumentation_level,
+    );
+    options.total_train_steps = total_steps;
+    options.refine_every = 200;
+    options.max_resolution = 1080;
+    options.max_splats = 500_000;
+    options.export_every = total_steps;
+    let mut state = V2CallbackState::default();
+
+    let started = Instant::now();
+    // SAFETY: callback state and all option strings outlive the blocking call.
+    let status = unsafe {
+        brush_c::train_and_save_v2(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status,
+        TrainExitCode::Success,
+        "Fast Preview evidence run failed"
+    );
+
+    let output = fs::read(
+        temp_dir
+            .path()
+            .join(format!("component-0_{total_steps}.ply")),
+    )
+    .unwrap();
+    let events = state.events.lock().unwrap();
+    let final_count = events
+        .last()
+        .filter(|event| event.0.kind == BrushEventKindV2::Terminal)
+        .map_or(0, |event| event.0.final_primitive_count);
+    Phase0RunEvidence {
+        elapsed,
+        output,
+        final_count,
+    }
+}
+
+fn median_duration(values: &mut [Duration]) -> Duration {
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+fn assert_numeric_outputs_equivalent(reference: &[u8], candidate: &[u8]) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (reference, candidate) = runtime.block_on(async {
+        let reference = brush_serde::load_splat_from_ply(reference, None)
+            .await
+            .unwrap()
+            .data;
+        let candidate = brush_serde::load_splat_from_ply(candidate, None)
+            .await
+            .unwrap()
+            .data;
+        (reference, candidate)
+    });
+    assert_eq!(
+        reference.num_splats(),
+        candidate.num_splats(),
+        "exported Gaussian count changed"
+    );
+
+    let compare = |name: &str, reference: &[f32], candidate: &[f32]| {
+        assert_eq!(reference.len(), candidate.len(), "{name} length changed");
+        let max_abs = reference
+            .iter()
+            .zip(candidate)
+            .map(|(reference, candidate)| (reference - candidate).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 1.0e-3,
+            "{name} exceeded frozen absolute tolerance: {max_abs}"
+        );
+    };
+    compare("means", &reference.means, &candidate.means);
+    compare(
+        "rotations",
+        reference.rotations.as_deref().unwrap(),
+        candidate.rotations.as_deref().unwrap(),
+    );
+    compare(
+        "log_scales",
+        reference.log_scales.as_deref().unwrap(),
+        candidate.log_scales.as_deref().unwrap(),
+    );
+    compare(
+        "SH coefficients",
+        reference.sh_coeffs.as_deref().unwrap(),
+        candidate.sh_coeffs.as_deref().unwrap(),
+    );
+    compare(
+        "opacity",
+        reference.raw_opacities.as_deref().unwrap(),
+        candidate.raw_opacities.as_deref().unwrap(),
+    );
+}
+
+#[test]
+#[ignore = "manual Fast Preview instrumentation overhead and determinism evidence"]
+fn validate_v2_phase0_overhead_and_determinism() {
+    // Warm the shared Metal/Burn setup and shader cache outside the samples.
+    let _ = run_phase0_evidence(0, 10);
+
+    let mut uninstrumented = Vec::new();
+    let mut instrumented = Vec::new();
+    for _ in 0..3 {
+        uninstrumented.push(run_phase0_evidence(0, 300));
+        instrumented.push(run_phase0_evidence(1, 300));
+    }
+
+    let baseline_is_byte_deterministic = uninstrumented
+        .iter()
+        .skip(1)
+        .all(|run| run.output == uninstrumented[0].output);
+    for run in &instrumented {
+        assert_numeric_outputs_equivalent(&uninstrumented[0].output, &run.output);
+        if baseline_is_byte_deterministic {
+            assert_eq!(
+                run.output, uninstrumented[0].output,
+                "instrumentation changed bytes after baseline byte determinism was proven"
+            );
+        }
+    }
+
+    let expected_count = instrumented[0].final_count;
+    assert!(expected_count > 0);
+    assert!(
+        instrumented
+            .iter()
+            .all(|run| run.final_count == expected_count)
+    );
+
+    let mut uninstrumented_times: Vec<_> = uninstrumented.iter().map(|run| run.elapsed).collect();
+    let mut instrumented_times: Vec<_> = instrumented.iter().map(|run| run.elapsed).collect();
+    let baseline_median = median_duration(&mut uninstrumented_times);
+    let instrumented_median = median_duration(&mut instrumented_times);
+    let overhead = instrumented_median.as_secs_f64() / baseline_median.as_secs_f64() - 1.0;
+    println!(
+        "phase0 evidence: baseline_byte_deterministic={baseline_is_byte_deterministic} baseline_median={baseline_median:?} instrumented_median={instrumented_median:?} overhead={:.3}% final_count={expected_count}",
+        overhead * 100.0
+    );
+    assert!(
+        overhead < 0.05,
+        "Phase 0 instrumentation overhead {:.3}% exceeded 5%",
+        overhead * 100.0
+    );
 }
 
 #[test]

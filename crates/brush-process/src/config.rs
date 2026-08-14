@@ -1,5 +1,22 @@
 use clap::{Args, Parser};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Host-only controls used by additive native ABIs. These are intentionally
+/// excluded from CLI/args-file serialization so existing callers retain their
+/// exact defaults and behavior.
+#[derive(Clone, Debug, Default)]
+pub struct HostRuntimeConfig {
+    /// When present, every host-controlled stochastic path uses this seed.
+    /// `None` preserves legacy random behavior.
+    pub deterministic_seed: Option<u64>,
+    /// Dataset-root-relative initializer selected explicitly by the host.
+    pub explicit_initializer_path: Option<PathBuf>,
+    /// Reject fallback/defaulted fields and require a complete Gaussian input.
+    pub require_strong_initializer: bool,
+    /// Emit the low-overhead Phase 0 event stream.
+    pub phase0_telemetry: bool,
+}
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -65,6 +82,9 @@ pub struct TrainStreamConfig {
     #[clap(flatten)]
     #[serde(flatten)]
     pub rerun_config: brush_rerun::RerunConfig,
+    #[arg(skip)]
+    #[serde(skip)]
+    pub host_runtime: HostRuntimeConfig,
 }
 
 impl Default for TrainStreamConfig {
