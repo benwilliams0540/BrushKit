@@ -2,7 +2,7 @@ import BrushKitFFI
 import Darwin
 import Foundation
 
-private struct CapturedEvent {
+struct CapturedEvent {
   var kind: Int32
   var iteration: UInt32
   var initializerRoute: Int32
@@ -10,7 +10,7 @@ private struct CapturedEvent {
   var text: String?
 }
 
-private final class EventBox: @unchecked Sendable {
+final class EventBox: @unchecked Sendable {
   private let lock = NSLock()
   private var storage: [CapturedEvent] = []
 
@@ -69,11 +69,13 @@ guard brush_get_native_identity_v2(
   fail("native identity query failed")
 }
 guard identity.abi_version == 2,
-      identity.build_revision != nil,
-      identity.graphics_backend != nil
+      let buildRevisionPointer = identity.build_revision,
+      let graphicsBackendPointer = identity.graphics_backend
 else {
   fail("native identity is incomplete")
 }
+let buildRevision = String(cString: buildRevisionPointer)
+let graphicsBackend = String(cString: graphicsBackendPointer)
 
 guard let datasetCString = strdup(datasetPath),
       let outputCString = strdup(outputPath),
@@ -154,4 +156,7 @@ guard outputs.contains(where: { $0 == "swift-v2-10.ply" }) else {
   fail("expected export was not written")
 }
 
-print("BrushKitV2Smoke: PASS abi=2 events=\(events.count) output=swift-v2-10.ply")
+print(
+  "BrushKitV2Smoke: PASS abi=2 revision=\(buildRevision) "
+    + "backend=\(graphicsBackend) events=\(events.count) output=swift-v2-10.ply"
+)
