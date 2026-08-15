@@ -289,7 +289,28 @@ pub(crate) async fn train_stream(
             SceneLoader::new(scene, dataloader_seed, &train_stream_config.load_config)
         }
     };
-    let mut dataloader = make_dataloader(&dataset.train);
+    let progressive_start_percent = train_stream_config
+        .host_runtime
+        .progressive_resolution_start_percent;
+    let progressive_switch_iteration = train_stream_config
+        .host_runtime
+        .progressive_resolution_switch_iteration;
+    let progressive_resolution_enabled = progressive_start_percent < 100
+        && progressive_switch_iteration > process_config.start_iter
+        && progressive_switch_iteration < train_stream_config.train_config.total_train_iters;
+    let progressive_scene = progressive_resolution_enabled.then(|| {
+        dataset
+            .train
+            .clone()
+            .with_image_scale(progressive_start_percent as f32 / 100.0)
+    });
+    let mut dataloader = make_dataloader(progressive_scene.as_ref().unwrap_or(&dataset.train));
+    if progressive_resolution_enabled {
+        log::info!(
+            "Progressive resolution: {progressive_start_percent}% through iteration {}, then 100%",
+            progressive_switch_iteration.saturating_sub(1)
+        );
+    }
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
 
     // Per-train-view (world center, focal-px at native res) for the
@@ -346,6 +367,10 @@ pub(crate) async fn train_stream(
 
     log::info!("Start training loop.");
     for iter in process_config.start_iter..train_stream_config.train_config.total_iters() {
+        if progressive_resolution_enabled && iter == progressive_switch_iteration {
+            dataloader = make_dataloader(&dataset.train);
+            log::info!("Progressive resolution: switched to 100% at iteration {iter}");
+        }
         let target_lod = if lod_levels == 0 || iter < training_steps {
             0u32
         } else {

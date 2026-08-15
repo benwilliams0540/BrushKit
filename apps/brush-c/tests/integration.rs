@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use brush_c::{
-    BRUSH_ABI_VERSION_V2, BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2, BrushEventKindV2, BrushEventV2,
-    BrushInitializerRouteV2, BrushNativeIdentityV2, ProgressMessage, ProgressMessageKind,
-    TrainExitCode, TrainOptions, TrainOptionsV2, brush_get_abi_version,
-    brush_get_native_identity_v2, brush_job_cancel, brush_job_release, brush_job_release_v2,
-    brush_job_retain_v2, brush_job_wait, brush_job_wait_v2, brush_train_start,
-    brush_train_start_v2, train_and_save,
+    BRUSH_ABI_VERSION_V2, BRUSH_ABI_VERSION_V3, BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2,
+    BrushEventKindV2, BrushEventV2, BrushInitializerRouteV2, BrushNativeIdentityV2,
+    ProgressMessage, ProgressMessageKind, TrainExitCode, TrainOptions, TrainOptionsV2,
+    TrainOptionsV3, brush_get_abi_version, brush_get_native_identity_v2, brush_job_cancel,
+    brush_job_release, brush_job_release_v2, brush_job_retain_v2, brush_job_wait,
+    brush_job_wait_v2, brush_train_start, brush_train_start_v2, brush_train_start_v3,
+    train_and_save,
 };
 
 #[repr(C)]
@@ -158,6 +159,34 @@ fn v2_options(
     }
 }
 
+fn v3_options(
+    output_path: &CString,
+    export_name: &CString,
+    initializer_path: &CString,
+) -> TrainOptionsV3 {
+    let v2 = v2_options(output_path, export_name, initializer_path, 1);
+    TrainOptionsV3 {
+        struct_size: std::mem::size_of::<TrainOptionsV3>() as u32,
+        abi_version: BRUSH_ABI_VERSION_V3,
+        seed: v2.seed,
+        render_mode: v2.render_mode,
+        sh_degree: v2.sh_degree,
+        sh_policy: v2.sh_policy,
+        total_train_steps: v2.total_train_steps,
+        refine_every: v2.refine_every,
+        max_resolution: v2.max_resolution,
+        max_splats: v2.max_splats,
+        export_every: v2.export_every,
+        output_path: v2.output_path,
+        export_name: v2.export_name,
+        initializer_path: v2.initializer_path,
+        initializer_required: v2.initializer_required,
+        instrumentation_level: v2.instrumentation_level,
+        progressive_resolution_start_percent: 50,
+        progressive_resolution_switch_iteration: 5,
+    }
+}
+
 #[test]
 fn test_v2_abi_identity_is_explicit() {
     assert_eq!(brush_get_abi_version(), 2);
@@ -209,6 +238,48 @@ fn test_v2_rejects_wrong_abi_synchronously_with_detail() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0.kind, BrushEventKindV2::Terminal);
     assert!(events[0].1.as_deref().unwrap().contains("ABI version"));
+}
+
+#[test]
+fn test_v3_progressive_resolution_job_preserves_v2_event_and_job_contracts() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_v3_progressive_")
+        .tempdir()
+        .unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let options = v3_options(&output_path, &export_name, &initializer);
+    let mut state = V2CallbackState::default();
+
+    // SAFETY: callback state and all option strings outlive wait and release.
+    let job = unsafe {
+        brush_train_start_v3(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert!(!job.is_null());
+    // SAFETY: V3 returns the retained V2 job ownership contract.
+    let status = unsafe { brush_job_wait_v2(job) };
+    // SAFETY: matching release for start.
+    unsafe { brush_job_release_v2(job) };
+    assert_eq!(status, TrainExitCode::Success);
+
+    let events = state.events.lock().unwrap();
+    assert_eq!(
+        events.first().unwrap().0.kind,
+        BrushEventKindV2::Capabilities
+    );
+    assert_eq!(
+        events.get(1).unwrap().0.kind,
+        BrushEventKindV2::Configuration
+    );
+    assert_eq!(events.last().unwrap().0.kind, BrushEventKindV2::Terminal);
+    assert!(temp_dir.path().join("component-0_10.ply").is_file());
 }
 
 #[test]

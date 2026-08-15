@@ -26,6 +26,7 @@ pub enum TrainExitCode {
 }
 
 pub const BRUSH_ABI_VERSION_V2: u32 = 2;
+pub const BRUSH_ABI_VERSION_V3: u32 = 3;
 pub const BRUSH_CAPABILITY_DATASET_BOUNDARIES_V2: u64 = 1 << 0;
 pub const BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2: u64 = 1 << 1;
 pub const BRUSH_CAPABILITY_STEP_TIMINGS_V2: u64 = 1 << 2;
@@ -112,6 +113,31 @@ pub struct TrainOptionsV2 {
     pub initializer_path: *const c_char,
     pub initializer_required: u8,
     pub instrumentation_level: u32,
+}
+
+/// Additive callable ABI for one explicit progressive-resolution transition.
+/// V2 remains available and retains its fixed-resolution behavior.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrainOptionsV3 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub seed: u64,
+    pub render_mode: u32,
+    pub sh_degree: u32,
+    pub sh_policy: u32,
+    pub total_train_steps: u32,
+    pub refine_every: u32,
+    pub max_resolution: u32,
+    pub max_splats: u32,
+    pub export_every: u32,
+    pub output_path: *const c_char,
+    pub export_name: *const c_char,
+    pub initializer_path: *const c_char,
+    pub initializer_required: u8,
+    pub instrumentation_level: u32,
+    pub progressive_resolution_start_percent: u32,
+    pub progressive_resolution_switch_iteration: u32,
 }
 
 #[repr(C)]
@@ -300,6 +326,12 @@ struct OwnedTrainOptionsV2 {
     instrumentation_level: u32,
 }
 
+struct OwnedTrainOptionsV3 {
+    base: OwnedTrainOptionsV2,
+    progressive_resolution_start_percent: u32,
+    progressive_resolution_switch_iteration: u32,
+}
+
 impl OwnedTrainOptions {
     /// # Safety
     ///
@@ -475,7 +507,89 @@ impl OwnedTrainOptionsV2 {
             explicit_initializer_path: self.initializer_path,
             require_strong_initializer: self.initializer_required,
             phase0_telemetry: self.instrumentation_level == 1,
+            progressive_resolution_start_percent: 100,
+            progressive_resolution_switch_iteration: 0,
         };
+        config
+    }
+}
+
+impl OwnedTrainOptionsV3 {
+    /// Copy and validate the complete V3 input before the worker starts.
+    unsafe fn copy_from(options: *const TrainOptionsV3) -> Result<Self, String> {
+        if options.is_null() {
+            return Err("V3 options pointer is null".to_owned());
+        }
+        // SAFETY: caller promises readable V3 storage; exact size is checked
+        // immediately after the copy.
+        let options = unsafe { *options };
+        if options.struct_size != mem::size_of::<TrainOptionsV3>() as u32 {
+            return Err(format!(
+                "V3 options struct_size {} does not match {}",
+                options.struct_size,
+                mem::size_of::<TrainOptionsV3>()
+            ));
+        }
+        if options.abi_version != BRUSH_ABI_VERSION_V3 {
+            return Err(format!(
+                "unsupported callable ABI version {}; expected {}",
+                options.abi_version, BRUSH_ABI_VERSION_V3
+            ));
+        }
+        if !(1..=100).contains(&options.progressive_resolution_start_percent) {
+            return Err("progressive_resolution_start_percent must be in 1...100".to_owned());
+        }
+        if options.progressive_resolution_start_percent < 100 {
+            if options.progressive_resolution_switch_iteration == 0
+                || options.progressive_resolution_switch_iteration >= options.total_train_steps
+            {
+                return Err(
+                    "progressive_resolution_switch_iteration must be between 1 and total_train_steps - 1"
+                        .to_owned(),
+                );
+            }
+        } else if options.progressive_resolution_switch_iteration != 0 {
+            return Err(
+                "progressive_resolution_switch_iteration must be 0 when start percent is 100"
+                    .to_owned(),
+            );
+        }
+
+        let v2 = TrainOptionsV2 {
+            struct_size: mem::size_of::<TrainOptionsV2>() as u32,
+            abi_version: BRUSH_ABI_VERSION_V2,
+            seed: options.seed,
+            render_mode: options.render_mode,
+            sh_degree: options.sh_degree,
+            sh_policy: options.sh_policy,
+            total_train_steps: options.total_train_steps,
+            refine_every: options.refine_every,
+            max_resolution: options.max_resolution,
+            max_splats: options.max_splats,
+            export_every: options.export_every,
+            output_path: options.output_path,
+            export_name: options.export_name,
+            initializer_path: options.initializer_path,
+            initializer_required: options.initializer_required,
+            instrumentation_level: options.instrumentation_level,
+        };
+        // SAFETY: `v2` is complete local storage and all C-string pointers are
+        // covered by the V3 caller contract.
+        let base = unsafe { OwnedTrainOptionsV2::copy_from(&v2) }?;
+        Ok(Self {
+            base,
+            progressive_resolution_start_percent: options.progressive_resolution_start_percent,
+            progressive_resolution_switch_iteration: options
+                .progressive_resolution_switch_iteration,
+        })
+    }
+
+    fn into_train_stream_config(self) -> TrainStreamConfig {
+        let mut config = self.base.into_train_stream_config();
+        config.host_runtime.progressive_resolution_start_percent =
+            self.progressive_resolution_start_percent;
+        config.host_runtime.progressive_resolution_switch_iteration =
+            self.progressive_resolution_switch_iteration;
         config
     }
 }
@@ -673,6 +787,91 @@ pub unsafe extern "C" fn brush_train_start_v2(
         .name("brush-c-train-v2".to_owned())
         .spawn(move || {
             run_training_job_v2(
+                dataset_path,
+                train_options,
+                JobCallback::V2 {
+                    callback: progress_callback,
+                    user_data_address,
+                    started,
+                    initial_primitive_count: 0,
+                    last_primitive_count: 0,
+                },
+                &worker_cancellation,
+            )
+        })
+    else {
+        let mut event = BrushEventV2::new(BrushEventKindV2::Terminal, 0);
+        event.error_code = BrushErrorCodeV2::Training;
+        emit_v2_with_text(
+            progress_callback,
+            user_data_address,
+            event,
+            "failed to create training worker",
+        );
+        return ptr::null_mut();
+    };
+
+    let state = Arc::new(BrushJobState {
+        cancellation_requested,
+        completion: Mutex::new(JobCompletion {
+            handle: Some(handle),
+            result: None,
+            joining: false,
+        }),
+        completion_changed: Condvar::new(),
+    });
+    Box::into_raw(Box::new(state)).cast::<BrushJobV2>()
+}
+
+/// Starts a callable ABI V3 training job. V3 adds one explicit
+/// progressive-resolution transition while retaining the V2 event and job
+/// ownership contracts.
+///
+/// # Safety
+/// All non-null string pointers must remain readable for this call. `user_data`
+/// must remain valid until a terminal callback or until the final retained job
+/// handle has been released after waiting.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brush_train_start_v3(
+    dataset_path: *const c_char,
+    options: *const TrainOptionsV3,
+    progress_callback: ProgressCallbackV2,
+    user_data: *mut c_void,
+) -> *mut BrushJobV2 {
+    let started = Instant::now();
+    let dataset_path = if dataset_path.is_null() {
+        Err("dataset_path pointer is null".to_owned())
+    } else {
+        // SAFETY: caller guarantees a null-terminated C string.
+        unsafe { CStr::from_ptr(dataset_path) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_utf8_error| "dataset_path is not valid UTF-8".to_owned())
+    };
+    // SAFETY: forwarded V3 pointer contract.
+    let options = unsafe { OwnedTrainOptionsV3::copy_from(options) };
+    let (dataset_path, train_options) = match (dataset_path, options) {
+        (Ok(dataset_path), Ok(options)) => (dataset_path, options),
+        (dataset_path, options) => {
+            let detail = dataset_path.err().or_else(|| options.err()).unwrap();
+            let mut event = BrushEventV2::new(BrushEventKindV2::Terminal, 0);
+            event.error_code = if detail.contains("ABI version") {
+                BrushErrorCodeV2::UnsupportedAbi
+            } else {
+                BrushErrorCodeV2::InvalidArgument
+            };
+            emit_v2_with_text(progress_callback, user_data as usize, event, &detail);
+            return ptr::null_mut();
+        }
+    };
+
+    let cancellation_requested = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation_requested);
+    let user_data_address = user_data as usize;
+    let Ok(handle) = std::thread::Builder::new()
+        .name("brush-c-train-v3".to_owned())
+        .spawn(move || {
+            run_training_job_v3(
                 dataset_path,
                 train_options,
                 JobCallback::V2 {
@@ -944,6 +1143,21 @@ fn run_training_job(
 fn run_training_job_v2(
     dataset_path: String,
     train_options: OwnedTrainOptionsV2,
+    callback: JobCallback,
+    cancellation_requested: &AtomicBool,
+) -> TrainExitCode {
+    run_training_job_with_config(
+        dataset_path,
+        train_options.into_train_stream_config(),
+        callback,
+        cancellation_requested,
+        true,
+    )
+}
+
+fn run_training_job_v3(
+    dataset_path: String,
+    train_options: OwnedTrainOptionsV3,
     callback: JobCallback,
     cancellation_requested: &AtomicBool,
 ) -> TrainExitCode {

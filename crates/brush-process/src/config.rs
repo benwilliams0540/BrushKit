@@ -16,6 +16,12 @@ pub struct HostRuntimeConfig {
     pub require_strong_initializer: bool,
     /// Emit the low-overhead Phase 0 event stream.
     pub phase0_telemetry: bool,
+    /// Percentage of `load_config.max_resolution` used before the explicit
+    /// progressive-resolution switch. `100` preserves the fixed-resolution path.
+    pub progressive_resolution_start_percent: u32,
+    /// Zero-based training iteration that switches from the reduced image scale
+    /// to the configured full resolution. `0` disables the transition.
+    pub progressive_resolution_switch_iteration: u32,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
