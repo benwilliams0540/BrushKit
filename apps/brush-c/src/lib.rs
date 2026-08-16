@@ -1440,6 +1440,9 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             optimizer_transforms_duration,
             optimizer_sh_coeffs_duration,
             optimizer_opacity_duration,
+            render_before_count_readback_duration,
+            render_count_readback_duration,
+            render_after_count_readback_duration,
             live_splat_count,
             ..
         }) => {
@@ -1471,7 +1474,25 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
                         duration_ns(*opacity),
                     )
                 });
-            event_and_text = Some((event, optimizer_substage_text));
+            let render_host_text = render_before_count_readback_duration
+                .as_ref()
+                .zip(render_count_readback_duration.as_ref())
+                .zip(render_after_count_readback_duration.as_ref())
+                .map(|((before, readback), after)| {
+                    format!(
+                        "render_host before_count_readback_ns={} count_readback_ns={} after_count_readback_ns={}",
+                        duration_ns(*before),
+                        duration_ns(*readback),
+                        duration_ns(*after),
+                    )
+                });
+            let telemetry_text = match (optimizer_substage_text, render_host_text) {
+                (Some(optimizer), Some(render)) => Some(format!("{optimizer}; {render}")),
+                (Some(optimizer), None) => Some(optimizer),
+                (None, Some(render)) => Some(render),
+                (None, None) => None,
+            };
+            event_and_text = Some((event, telemetry_text));
         }
         ProcessMessage::TrainMessage(TrainMessage::RefineStep {
             cur_splat_count,

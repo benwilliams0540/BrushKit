@@ -24,6 +24,7 @@ serde.workspace = true
 tracing.workspace = true
 log.workspace = true
 bytemuck.workspace = true
+web-time.workspace = true
 
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 

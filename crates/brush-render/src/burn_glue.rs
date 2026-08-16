@@ -16,6 +16,7 @@ use burn_fusion::{
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use burn_wgpu::WgpuRuntime;
 use glam::Vec3;
+use web_time::Instant;
 
 use crate::{
     RenderAuxInner, SplatOps, camera::Camera, gaussian_splats::SplatRenderMode,
@@ -221,7 +222,9 @@ impl SplatOps for Fusion<MainBackendBase> {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
+        host_timing_enabled: bool,
     ) -> RenderOutput<Self> {
+        let wrapper_start = host_timing_enabled.then(Instant::now);
         let client = transforms.client.clone();
 
         // Resolve fusion inputs to MainBackendBase tensors. This
@@ -237,6 +240,8 @@ impl SplatOps for Fusion<MainBackendBase> {
             .resolve_tensor_float::<MainBackendBase>(raw_opacities);
 
         // Run the full pipeline on MainBackendBase.
+        let wrapper_before_base_ns =
+            wrapper_start.map(|start| start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         let out = MainBackendBase::render(
             camera,
             img_size,
@@ -246,8 +251,11 @@ impl SplatOps for Fusion<MainBackendBase> {
             render_mode,
             background,
             pass,
+            host_timing_enabled,
         )
         .await;
+        let wrapper_after_base_start = host_timing_enabled.then(Instant::now);
+        let mut host_timings = out.host_timings;
 
         // Bind precomputed outputs back into the fusion stream.
         #[derive(Debug)]
@@ -375,6 +383,19 @@ impl SplatOps for Fusion<MainBackendBase> {
             global_from_compact_gid,
         ] = outputs;
 
+        if let Some(timings) = host_timings.as_mut() {
+            timings.before_count_readback_ns = timings.before_count_readback_ns.saturating_add(
+                wrapper_before_base_ns.expect("enabled timing must have a wrapper prelude"),
+            );
+            timings.after_count_readback_ns = timings.after_count_readback_ns.saturating_add(
+                wrapper_after_base_start
+                    .expect("enabled timing must have a wrapper postlude")
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+        }
+
         RenderOutput {
             out_img,
             aux: RenderAuxInner {
@@ -389,6 +410,7 @@ impl SplatOps for Fusion<MainBackendBase> {
             compact_gid_from_isect,
             project_uniforms: out.project_uniforms,
             global_from_compact_gid,
+            host_timings,
         }
     }
 }

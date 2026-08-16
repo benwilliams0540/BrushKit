@@ -347,7 +347,7 @@ pub(crate) async fn train_stream(
     let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
     trainer.set_view_cams(view_cams.clone());
     trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
-    trainer.set_optimizer_substage_telemetry(train_stream_config.host_runtime.phase0_telemetry);
+    trainer.set_phase0_host_telemetry(train_stream_config.host_runtime.phase0_telemetry);
     if train_stream_config.host_runtime.phase0_telemetry {
         emitter
             .emit(ProcessMessage::TrainMessage(
@@ -472,9 +472,7 @@ pub(crate) async fn train_stream(
             trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
             trainer.set_view_cams(view_cams.clone());
             trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
-            trainer.set_optimizer_substage_telemetry(
-                train_stream_config.host_runtime.phase0_telemetry,
-            );
+            trainer.set_phase0_host_telemetry(train_stream_config.host_runtime.phase0_telemetry);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -736,6 +734,11 @@ pub(crate) async fn train_stream(
                     optimizer_transforms_duration: stats.optimizer_transforms_duration,
                     optimizer_sh_coeffs_duration: stats.optimizer_sh_coeffs_duration,
                     optimizer_opacity_duration: stats.optimizer_opacity_duration,
+                    render_before_count_readback_duration: stats
+                        .render_before_count_readback_duration,
+                    render_count_readback_duration: stats.render_count_readback_duration,
+                    render_after_count_readback_duration: stats
+                        .render_after_count_readback_duration,
                     live_splat_count: refine.total_splats,
                     lod_progress,
                 }))

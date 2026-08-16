@@ -5,7 +5,7 @@ use brush_render::burn_glue::{
     AutodiffMain, lift_to_autodiff, unwrap_ad_wgpu_float, wrap_ad_wgpu_float, wrap_wgpu_float,
 };
 use brush_render::{
-    SplatOps,
+    RenderHostTimings, SplatOps,
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats, fold_min_scale},
     sh::sh_coeffs_for_degree,
@@ -32,6 +32,7 @@ use burn_fusion::{
 };
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use glam::Vec3;
+use web_time::Instant;
 
 /// Intermediate gradients from the rasterize backward pass.
 ///
@@ -184,6 +185,10 @@ pub struct SplatOutputDiff {
     /// Per-splat max screen radius aux — on the **inner** backend (no gradients).
     pub max_radius: Tensor<1>,
     pub refine_weight_holder: Tensor<1>,
+    /// Present only when explicitly enabled by the trainer. The existing
+    /// atomic-count readback can drain prior queued GPU work, so these are
+    /// host attribution diagnostics rather than GPU substage durations.
+    pub host_timings: Option<RenderHostTimings>,
 }
 
 /// Equivalent to `Module::train()` for [`Splats`], routing through
@@ -220,12 +225,32 @@ pub async fn render_splats(
     img_size: glam::UVec2,
     background: Vec3,
 ) -> SplatOutputDiff {
-    render_splats_with_pass(
+    render_splats_impl(
         splats,
         camera,
         img_size,
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
+        false,
+    )
+    .await
+}
+
+/// Render with host clocks around the existing count-readback boundary.
+/// Enabling this does not introduce any additional GPU synchronization.
+pub async fn render_splats_with_host_timing(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+) -> SplatOutputDiff {
+    render_splats_impl(
+        splats,
+        camera,
+        img_size,
+        background,
+        brush_render::gaussian_splats::RasterPass::Backward,
+        true,
     )
     .await
 }
@@ -241,6 +266,18 @@ pub async fn render_splats_with_pass(
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
 ) -> SplatOutputDiff {
+    render_splats_impl(splats, camera, img_size, background, pass, false).await
+}
+
+async fn render_splats_impl(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: brush_render::gaussian_splats::RasterPass,
+    host_timing_enabled: bool,
+) -> SplatOutputDiff {
+    let wrapper_start = host_timing_enabled.then(Instant::now);
     splats.clone().validate_values().await;
 
     let device = splats.device();
@@ -292,6 +329,8 @@ pub async fn render_splats_with_pass(
         pass.bwd_info(),
         "render_splats_with_pass requires a Backward variant"
     );
+    let wrapper_before_render_ns =
+        wrapper_start.map(|start| start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
     let output = <MainBackend as SplatOps>::render(
         camera,
         img_size,
@@ -301,8 +340,10 @@ pub async fn render_splats_with_pass(
         render_mode,
         background,
         pass,
+        host_timing_enabled,
     )
     .await;
+    let wrapper_after_render_start = host_timing_enabled.then(Instant::now);
 
     output.clone().validate().await;
 
@@ -332,6 +373,20 @@ pub async fn render_splats_with_pass(
         OpsKind::UnTracked(prep) => prep.finish(output.out_img),
     };
 
+    let mut host_timings = output.host_timings;
+    if let Some(timings) = host_timings.as_mut() {
+        timings.before_count_readback_ns = timings.before_count_readback_ns.saturating_add(
+            wrapper_before_render_ns.expect("enabled timing must have a wrapper prelude"),
+        );
+        timings.after_count_readback_ns = timings.after_count_readback_ns.saturating_add(
+            wrapper_after_render_start
+                .expect("enabled timing must have a wrapper postlude")
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+    }
+
     SplatOutputDiff {
         img: wrap_ad_wgpu_float(img_ad),
         num_visible,
@@ -341,6 +396,7 @@ pub async fn render_splats_with_pass(
         visible: wrap_wgpu_float(visible_inner),
         max_radius: wrap_wgpu_float(max_radius_inner),
         refine_weight_holder,
+        host_timings,
     }
 }
 

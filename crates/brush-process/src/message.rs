@@ -62,6 +62,9 @@ pub enum TrainMessage {
         optimizer_transforms_duration: Option<web_time::Duration>,
         optimizer_sh_coeffs_duration: Option<web_time::Duration>,
         optimizer_opacity_duration: Option<web_time::Duration>,
+        render_before_count_readback_duration: Option<web_time::Duration>,
+        render_count_readback_duration: Option<web_time::Duration>,
+        render_after_count_readback_duration: Option<web_time::Duration>,
         live_splat_count: u32,
         /// If in LOD phase: `(current_lod_1_based, total_lod_levels)`.
         lod_progress: Option<(u32, u32)>,

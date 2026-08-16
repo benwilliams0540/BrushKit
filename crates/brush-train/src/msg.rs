@@ -40,6 +40,14 @@ pub struct TrainStepStats {
     /// Host-observed duration for the opacity optimizer call. Present only
     /// when the host explicitly enables optimizer-substage telemetry.
     pub optimizer_opacity_duration: Option<Duration>,
+    /// Host time before the render pipeline's existing count readback.
+    pub render_before_count_readback_duration: Option<Duration>,
+    /// Host time awaiting the existing count readback. This can include GPU
+    /// work queued by the prior step; it is not current-step raster time.
+    pub render_count_readback_duration: Option<Duration>,
+    /// Host time after the count readback while remaining render work is
+    /// enqueued. No additional synchronization is introduced.
+    pub render_after_count_readback_duration: Option<Duration>,
     // Non-autodiff inner tensor; consumers read the scalar lazily so disabled
     // logging doesn't force a GPU readback.
     pub loss: Tensor<1>,

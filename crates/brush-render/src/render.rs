@@ -6,7 +6,7 @@ use crate::{
     gaussian_splats::{RasterPass, SplatRenderMode},
     get_tile_offset::{CHECKS_PER_ITER, get_tile_offsets},
     kernels,
-    render_aux::RenderOutput,
+    render_aux::{RenderHostTimings, RenderOutput},
     sh::sh_degree_from_coeffs,
     shaders,
 };
@@ -25,6 +25,11 @@ use burn_wgpu::WgpuRuntime;
 use glam::{Vec3, uvec2};
 use kernels::types::RasterizeUniformsLaunch;
 use std::f32::consts::PI;
+use web_time::{Duration, Instant};
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 #[doc(hidden)]
 pub fn calc_tile_bounds(img_size: glam::UVec2) -> glam::UVec2 {
@@ -45,7 +50,9 @@ impl SplatOps for MainBackendBase {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: RasterPass,
+        host_timing_enabled: bool,
     ) -> RenderOutput<Self> {
+        let render_start = host_timing_enabled.then(Instant::now);
         assert!(
             img_size[0] > 0 && img_size[1] > 0,
             "Can't render images with 0 size."
@@ -143,6 +150,8 @@ impl SplatOps for MainBackendBase {
         };
 
         // Read both atomic counts in one transaction BEFORE the sort.
+        let before_count_readback_ns = render_start.map(|start| duration_ns(start.elapsed()));
+        let count_readback_start = host_timing_enabled.then(Instant::now);
         let (num_visible, num_intersections) = if total_splats == 0 {
             (0, 0)
         } else {
@@ -165,6 +174,8 @@ impl SplatOps for MainBackendBase {
                 .expect("num_intersections")[0];
             (num_visible, num_intersections)
         };
+        let count_readback_ns = count_readback_start.map(|start| duration_ns(start.elapsed()));
+        let after_count_readback_start = host_timing_enabled.then(Instant::now);
 
         project_uniforms.num_visible = num_visible;
 
@@ -292,6 +303,16 @@ impl SplatOps for MainBackendBase {
                 smooth_cutoff,
             );
         });
+        let host_timings = before_count_readback_ns
+            .zip(count_readback_ns)
+            .zip(after_count_readback_start)
+            .map(
+                |((before_count_readback_ns, count_readback_ns), start)| RenderHostTimings {
+                    before_count_readback_ns,
+                    count_readback_ns,
+                    after_count_readback_ns: duration_ns(start.elapsed()),
+                },
+            );
         RenderOutput {
             out_img,
             aux: RenderAuxInner {
@@ -306,6 +327,7 @@ impl SplatOps for MainBackendBase {
             compact_gid_from_isect,
             project_uniforms,
             global_from_compact_gid,
+            host_timings,
         }
     }
 }

@@ -13,7 +13,7 @@ use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::render_splats;
+use brush_render_bwd::{render_splats, render_splats_with_host_timing};
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -68,9 +68,10 @@ pub struct SplatTrainer {
     /// Present only for callers that explicitly request deterministic host RNG.
     /// Legacy callers continue to use thread-local entropy exactly as before.
     deterministic_rng: Option<rand::rngs::StdRng>,
-    /// Adds host clocks around the three existing optimizer calls. Disabled by
-    /// default so ordinary callers retain the exact training path.
-    optimizer_substage_telemetry: bool,
+    /// Adds host clocks around the three existing optimizer calls and the
+    /// render pipeline's existing count readback. Disabled by default so
+    /// ordinary callers retain the exact training path.
+    phase0_host_telemetry: bool,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -152,7 +153,7 @@ impl SplatTrainer {
             max_sh_degree: 0,
             view_cams: Vec::new(),
             deterministic_rng: None,
-            optimizer_substage_telemetry: false,
+            phase0_host_telemetry: false,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -168,8 +169,8 @@ impl SplatTrainer {
         self.deterministic_rng = seed.map(rand::rngs::StdRng::seed_from_u64);
     }
 
-    pub fn set_optimizer_substage_telemetry(&mut self, enabled: bool) {
-        self.optimizer_substage_telemetry = enabled;
+    pub fn set_phase0_host_telemetry(&mut self, enabled: bool) {
+        self.phase0_host_telemetry = enabled;
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
@@ -217,15 +218,23 @@ impl SplatTrainer {
             forward_duration,
             loss_duration,
             backward_duration,
+            render_host_timings,
         ) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
             let forward_start = Instant::now();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
-                .instrument(trace_span!("Forward"))
-                .await;
+            let diff_out = if self.phase0_host_telemetry {
+                render_splats_with_host_timing(render_input, &camera, img_size, background)
+                    .instrument(trace_span!("Forward"))
+                    .await
+            } else {
+                render_splats(render_input, &camera, img_size, background)
+                    .instrument(trace_span!("Forward"))
+                    .await
+            };
             let forward_duration = forward_start.elapsed();
+            let render_host_timings = diff_out.host_timings;
 
             let pred_image = diff_out.img;
             let refine_weight_holder = diff_out.refine_weight_holder;
@@ -325,6 +334,7 @@ impl SplatTrainer {
                 forward_duration,
                 loss_duration,
                 backward_duration,
+                render_host_timings,
             )
         };
 
@@ -391,7 +401,7 @@ impl SplatTrainer {
             *optimizer = create_optimizer_from_config().load_record(record);
         }
 
-        let optimizer_substage_telemetry = self.optimizer_substage_telemetry;
+        let optimizer_substage_telemetry = self.phase0_host_telemetry;
         let optimizer_start = Instant::now();
         let mut optimizer_transforms_duration = None;
         let mut optimizer_sh_coeffs_duration = None;
@@ -473,6 +483,12 @@ impl SplatTrainer {
             optimizer_transforms_duration,
             optimizer_sh_coeffs_duration,
             optimizer_opacity_duration,
+            render_before_count_readback_duration: render_host_timings
+                .map(|timings| web_time::Duration::from_nanos(timings.before_count_readback_ns)),
+            render_count_readback_duration: render_host_timings
+                .map(|timings| web_time::Duration::from_nanos(timings.count_readback_ns)),
+            render_after_count_readback_duration: render_host_timings
+                .map(|timings| web_time::Duration::from_nanos(timings.after_count_readback_ns)),
             loss: loss_inner,
         };
 

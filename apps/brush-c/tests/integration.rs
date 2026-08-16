@@ -382,6 +382,9 @@ fn test_v2_strong_initializer_and_phase0_events() {
                     text.starts_with("optimizer_substages transforms_ns=")
                         && text.contains(" sh_coeffs_ns=")
                         && text.contains(" opacity_ns=")
+                        && text.contains("; render_host before_count_readback_ns=")
+                        && text.contains(" count_readback_ns=")
+                        && text.contains(" after_count_readback_ns=")
                 })
             })
     );
@@ -410,7 +413,7 @@ fn test_v2_strong_initializer_and_phase0_events() {
 }
 
 #[test]
-fn test_v2_optimizer_substage_telemetry_is_opt_in() {
+fn test_v2_phase0_host_telemetry_is_opt_in() {
     let dataset_path = test_dataset_path();
     let temp_dir = tempfile::Builder::new()
         .prefix("ffi_v2_optimizer_telemetry_off_")

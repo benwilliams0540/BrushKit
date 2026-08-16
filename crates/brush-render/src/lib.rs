@@ -9,7 +9,7 @@ use glam::Vec3;
 
 use crate::gaussian_splats::SplatRenderMode;
 pub use crate::gaussian_splats::{Splats, TextureMode, render_splats};
-pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderOutput};
+pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderHostTimings, RenderOutput};
 
 pub mod burn_glue;
 #[doc(hidden)]
@@ -75,6 +75,7 @@ pub trait SplatOps: Backend {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: gaussian_splats::RasterPass,
+        host_timing_enabled: bool,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }
 

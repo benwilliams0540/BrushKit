@@ -9,6 +9,17 @@ use burn::{
 
 use crate::shaders::helpers::ProjectUniforms;
 
+/// Host-observed timing around the render pipeline's existing atomic-count
+/// readback. These clocks never add a readback or otherwise synchronize the
+/// GPU. The readback wait may include GPU commands queued by the prior train
+/// step, so it must not be interpreted as current-step rasterization time.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderHostTimings {
+    pub before_count_readback_ns: u64,
+    pub count_readback_ns: u64,
+    pub after_count_readback_ns: u64,
+}
+
 /// Internal render output used by kernel impls. Holds backend primitives.
 ///
 /// `ExtensionType` lets the `#[backend_extension]`-generated `Dispatch` impl
@@ -23,6 +34,8 @@ pub struct RenderOutput<B: Backend> {
     pub compact_gid_from_isect: IntTensor<B>,
     pub project_uniforms: ProjectUniforms,
     pub global_from_compact_gid: IntTensor<B>,
+    /// Present only when the caller explicitly enables host timing.
+    pub host_timings: Option<RenderHostTimings>,
 }
 
 impl<B: Backend> RenderOutput<B> {

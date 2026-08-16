@@ -23,6 +23,7 @@ burn-ir.workspace = true
 
 glam.workspace = true
 tracing.workspace = true
+web-time.workspace = true
 
 [dev-dependencies]
 # Enable debug-validation feature when running tests
