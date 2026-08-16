@@ -7,6 +7,18 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_ply::{SerializeError, SerializeOptions};
 use thiserror::Error;
+use web_time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SplatExportValidationReport {
+    pub original_splat_count: u32,
+    pub exported_splat_count: u32,
+    pub pruned_non_finite_count: u32,
+    pub transforms_non_finite_row_count: u32,
+    pub sh_coeffs_non_finite_row_count: u32,
+    pub opacity_non_finite_row_count: u32,
+    pub validation_duration: Duration,
+}
 
 #[derive(Debug, Error)]
 pub enum ExportError {
@@ -14,6 +26,13 @@ pub enum ExportError {
     FetchFailed,
     #[error("Failed to convert tensor data to f32 - data may be corrupted")]
     DataConversion,
+    #[error(
+        "Export validation rejected every Gaussian: original={original_splat_count}, non_finite={pruned_non_finite_count}"
+    )]
+    NoFiniteSplats {
+        original_splat_count: u32,
+        pruned_non_finite_count: u32,
+    },
     #[error("PLY serialization failed: {0}")]
     Serialize(#[from] SerializeError),
 }
@@ -79,7 +98,9 @@ struct DynamicPly {
     vertex: Vec<DynamicPlyGaussian>,
 }
 
-async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
+async fn read_splat_data(
+    splats: Splats,
+) -> Result<(DynamicPly, SplatExportValidationReport), ExportError> {
     let data = Transaction::default()
         .register(splats.transforms.val())
         .register(splats.raw_opacities.val())
@@ -115,13 +136,30 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
     let coeffs_per_channel = sh_coeffs_for_degree(sh_degree) as usize;
     let rest_coeffs_per_channel = coeffs_per_channel - 1;
 
-    let vertices = (0..splats.num_splats())
-        .map(|i| {
+    let original_splat_count = splats.num_splats();
+    let validation_started = Instant::now();
+    let mut report = SplatExportValidationReport {
+        original_splat_count,
+        ..Default::default()
+    };
+    let vertices: Vec<_> = (0..original_splat_count)
+        .filter_map(|i| {
             let i = i as usize;
             // Read SH data from [coeffs, channel] format
             let sh_start = i * sh_coeffs_num * 3;
             let sh_end = (i + 1) * sh_coeffs_num * 3;
             let splat_sh = &sh_coeffs[sh_start..sh_end];
+            let t = i * 10;
+            let transform_non_finite = transforms[t..t + 10].iter().any(|value| !value.is_finite());
+            let sh_non_finite = splat_sh.iter().any(|value| !value.is_finite());
+            let opacity_non_finite = !raw_opacities[i].is_finite();
+            if transform_non_finite || sh_non_finite || opacity_non_finite {
+                report.pruned_non_finite_count += 1;
+                report.transforms_non_finite_row_count += u32::from(transform_non_finite);
+                report.sh_coeffs_non_finite_row_count += u32::from(sh_non_finite);
+                report.opacity_non_finite_row_count += u32::from(opacity_non_finite);
+                return None;
+            }
             let [sh_red, sh_green, sh_blue] = [
                 &splat_sh[0..sh_coeffs_num],
                 &splat_sh[sh_coeffs_num..sh_coeffs_num * 2],
@@ -145,7 +183,6 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
 
             let rest_coeffs = [sh_red_rest, sh_green_rest, sh_blue_rest].concat();
             // transforms layout: means(3) + rotations(4) + log_scales(3) = stride 10
-            let t = i * 10;
             // Normalize the quaternion before export.
             let (r0, r1, r2, r3): (f32, f32, f32, f32) = (
                 transforms[t + 3],
@@ -154,7 +191,7 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
                 transforms[t + 6],
             );
             let rn = (r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3).sqrt().max(1e-12);
-            DynamicPlyGaussian {
+            Some(DynamicPlyGaussian {
                 x: transforms[t],
                 y: transforms[t + 1],
                 z: transforms[t + 2],
@@ -170,18 +207,32 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
                 f_dc_1: sh_green[0],
                 f_dc_2: sh_blue[0],
                 rest_coeffs,
-            }
+            })
         })
         .collect();
-    Ok(DynamicPly { vertex: vertices })
+    report.exported_splat_count = vertices.len() as u32;
+    report.validation_duration = validation_started.elapsed();
+    if vertices.is_empty() {
+        return Err(ExportError::NoFiniteSplats {
+            original_splat_count,
+            pruned_non_finite_count: report.pruned_non_finite_count,
+        });
+    }
+    Ok((DynamicPly { vertex: vertices }, report))
 }
 
 pub async fn splat_to_ply(splats: Splats) -> Result<Vec<u8>, ExportError> {
+    Ok(splat_to_ply_with_report(splats).await?.0)
+}
+
+pub async fn splat_to_ply_with_report(
+    splats: Splats,
+) -> Result<(Vec<u8>, SplatExportValidationReport), ExportError> {
     // Fold any 3D-filter floor into the stored scales/opacity so the ply holds
     // ordinary derived values — the floor is never written as a separate field.
     let splats = splats.bake_min_scale();
     let sh_degree = splats.sh_degree();
-    let ply = read_splat_data(splats.clone()).await?;
+    let (ply, report) = read_splat_data(splats.clone()).await?;
 
     let render_mode_str = if splats.render_mip { "mip" } else { "default" };
 
@@ -191,10 +242,10 @@ pub async fn splat_to_ply(splats: Splats) -> Result<Vec<u8>, ExportError> {
         format!("SH degree: {}", sh_degree),
         format!("SplatRenderMode: {}", render_mode_str),
     ];
-    Ok(serde_ply::to_bytes(
-        &ply,
-        SerializeOptions::binary_le().with_comments(comments),
-    )?)
+    Ok((
+        serde_ply::to_bytes(&ply, SerializeOptions::binary_le().with_comments(comments))?,
+        report,
+    ))
 }
 
 #[cfg(test)]
@@ -203,7 +254,8 @@ mod tests {
     use crate::import::load_splat_from_ply;
     use crate::test_utils::create_test_splats;
 
-    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::gaussian_splats::{SplatRenderMode, Splats};
+    use burn::tensor::{Tensor, TensorData};
     use std::io::Cursor;
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -244,7 +296,8 @@ mod tests {
             let splats = create_test_splats(degree);
             assert_eq!(splats.sh_degree(), degree);
 
-            let ply_data = read_splat_data(splats.clone()).await.unwrap();
+            let (ply_data, report) = read_splat_data(splats.clone()).await.unwrap();
+            assert_eq!(report.pruned_non_finite_count, 0);
             let expected_rest_coeffs = if degree == 0 {
                 0
             } else {
@@ -341,5 +394,112 @@ mod tests {
             assert_eq!(imported.sh_degree(), degree);
             assert_coeffs_match(&original, &imported).await;
         }
+    }
+
+    fn splats_with_non_finite_rows(device: &burn::tensor::Device) -> Splats {
+        let means = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![
+                    0.0,
+                    0.0,
+                    0.0,
+                    f32::NAN,
+                    1.0,
+                    1.0,
+                    2.0,
+                    2.0,
+                    2.0,
+                    3.0,
+                    3.0,
+                    3.0,
+                ],
+                [4, 3],
+            ),
+            device,
+        );
+        let rotations = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+                ],
+                [4, 4],
+            ),
+            device,
+        );
+        let log_scales = Tensor::<2>::zeros([4, 3], device);
+        let sh_coeffs = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.1,
+                    0.2,
+                    0.3,
+                    0.4,
+                    0.5,
+                    0.6,
+                    f32::INFINITY,
+                    0.8,
+                    0.9,
+                    1.0,
+                    1.1,
+                    1.2,
+                ],
+                [4, 1, 3],
+            ),
+            device,
+        );
+        let raw_opacity =
+            Tensor::<1>::from_data(TensorData::new(vec![0.0, 0.0, 0.0, f32::NAN], [4]), device);
+        Splats::from_tensor_data(
+            means,
+            rotations,
+            log_scales,
+            sh_coeffs,
+            raw_opacity,
+            SplatRenderMode::Default,
+        )
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn terminal_export_compacts_non_finite_rows_and_reports_properties() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let splats = splats_with_non_finite_rows(&device);
+
+        let (ply_bytes, report) = splat_to_ply_with_report(splats)
+            .await
+            .expect("finite remainder should export");
+
+        assert_eq!(report.original_splat_count, 4);
+        assert_eq!(report.exported_splat_count, 1);
+        assert_eq!(report.pruned_non_finite_count, 3);
+        assert_eq!(report.transforms_non_finite_row_count, 1);
+        assert_eq!(report.sh_coeffs_non_finite_row_count, 1);
+        assert_eq!(report.opacity_non_finite_row_count, 1);
+
+        let imported = load_splat_from_ply(Cursor::new(ply_bytes), None)
+            .await
+            .expect("compacted PLY should reimport");
+        assert_eq!(imported.data.num_splats(), 1);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn terminal_export_rejects_an_all_non_finite_population() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let mut splats = splats_with_non_finite_rows(&device);
+        splats.transforms = splats.transforms.map(|transforms| {
+            let all_bad = Tensor::<2>::full([4, 10], f32::NAN, &device);
+            transforms.slice_assign([0..4, 0..10], all_bad)
+        });
+
+        let error = splat_to_ply_with_report(splats)
+            .await
+            .expect_err("an empty finite population must not be exported");
+
+        assert!(matches!(
+            error,
+            ExportError::NoFiniteSplats {
+                original_splat_count: 4,
+                pruned_non_finite_count: 4,
+            }
+        ));
     }
 }

@@ -423,7 +423,7 @@ pub(crate) async fn train_stream(
                         .with_context(|| "Export at LOD boundary failed");
 
                 match res {
-                    Ok(path) => {
+                    Ok((path, _report)) => {
                         emitter
                             .emit(ProcessMessage::TrainMessage(
                                 TrainMessage::CheckpointExported {
@@ -594,7 +594,26 @@ pub(crate) async fn train_stream(
                         .with_context(|| format!("Export at iteration {iter} failed"));
 
                 match res {
-                    Ok(path) => {
+                    Ok((path, report)) => {
+                        if is_last_step {
+                            if report.pruned_non_finite_count > 0 {
+                                log::warn!(
+                                    "Terminal export compacted {} non-finite Gaussians (transforms={}, sh={}, opacity={})",
+                                    report.pruned_non_finite_count,
+                                    report.transforms_non_finite_row_count,
+                                    report.sh_coeffs_non_finite_row_count,
+                                    report.opacity_non_finite_row_count,
+                                );
+                            }
+                            emitter
+                                .emit(ProcessMessage::TrainMessage(
+                                    TrainMessage::TerminalCompaction {
+                                        iter: exp_iter,
+                                        report,
+                                    },
+                                ))
+                                .await;
+                        }
                         emitter
                             .emit(ProcessMessage::TrainMessage(
                                 TrainMessage::CheckpointExported {
@@ -991,18 +1010,18 @@ async fn export_checkpoint(
     export_name: &str,
     iter: u32,
     total_steps: u32,
-) -> Result<PathBuf, anyhow::Error> {
+) -> Result<(PathBuf, brush_serde::SplatExportValidationReport), anyhow::Error> {
     tokio::fs::create_dir_all(&export_path)
         .await
         .with_context(|| format!("Creating export directory {}", export_path.display()))?;
     let digits = ((total_steps as f64).log10().floor() as usize) + 1;
     let export_name = export_name.replace("{iter}", &format!("{iter:0digits$}"));
-    let splat_data = brush_serde::splat_to_ply(splats)
+    let (splat_data, report) = brush_serde::splat_to_ply_with_report(splats)
         .await
         .context("Serializing splat data")?;
     let output_path = export_path.join(&export_name);
     tokio::fs::write(&output_path, splat_data)
         .await
         .context(format!("Failed to export ply {export_path:?}"))?;
-    Ok(output_path)
+    Ok((output_path, report))
 }

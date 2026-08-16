@@ -99,6 +99,11 @@ pub enum TrainMessage {
         iter: u32,
         path: PathBuf,
     },
+    /// Exhaustive validation/compaction of the terminal export population.
+    TerminalCompaction {
+        iter: u32,
+        report: brush_serde::SplatExportValidationReport,
+    },
     DoneTraining,
 }
 

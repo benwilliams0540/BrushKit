@@ -36,6 +36,7 @@ pub const BRUSH_CAPABILITY_ADAPTER_IDENTITY_V2: u64 = 1 << 5;
 pub const BRUSH_CAPABILITY_GPU_MEMORY_V2: u64 = 1 << 6;
 pub const BRUSH_CAPABILITY_GPU_COMMAND_TIMING_V2: u64 = 1 << 7;
 pub const BRUSH_CAPABILITY_CPU_WAIT_TIMING_V2: u64 = 1 << 8;
+pub const BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2: u64 = 1 << 9;
 pub const BRUSH_RENDER_MODE_DEFAULT_V2: u32 = 0;
 pub const BRUSH_RENDER_MODE_MIP_V2: u32 = 1;
 pub const BRUSH_SH_POLICY_PRESERVE_AND_ZERO_PAD_V2: u32 = 0;
@@ -52,7 +53,8 @@ const BRUSH_AVAILABLE_CAPABILITIES_V2: u64 = BRUSH_CAPABILITY_DATASET_BOUNDARIES
     | BRUSH_CAPABILITY_STEP_TIMINGS_V2
     | BRUSH_CAPABILITY_REFINEMENT_COUNTS_V2
     | BRUSH_CAPABILITY_OPERATION_TIMINGS_V2
-    | BRUSH_CAPABILITY_CPU_WAIT_TIMING_V2;
+    | BRUSH_CAPABILITY_CPU_WAIT_TIMING_V2
+    | BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +71,7 @@ pub enum BrushEventKindV2 {
     CheckpointExportStarted = 9,
     CheckpointExported = 10,
     Terminal = 11,
+    TerminalCompaction = 12,
 }
 
 #[repr(C)]
@@ -1498,6 +1501,33 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             let mut event = BrushEventV2::new(BrushEventKindV2::CheckpointExportStarted, timestamp);
             event.iteration = *iter;
             event_and_text = Some((event, None));
+        }
+        ProcessMessage::TrainMessage(TrainMessage::TerminalCompaction { iter, report }) => {
+            let mut event = BrushEventV2::new(BrushEventKindV2::TerminalCompaction, timestamp);
+            event.iteration = *iter;
+            event.primitive_count = report.exported_splat_count;
+            event.pruned_count = report.pruned_non_finite_count;
+            event.pruned_non_finite_count = report.pruned_non_finite_count;
+            event.net_growth = -i64::from(report.pruned_non_finite_count);
+            event.densification_and_compaction_ns = duration_ns(report.validation_duration);
+            if let JobCallback::V2 {
+                last_primitive_count,
+                ..
+            } = callback
+            {
+                *last_primitive_count = report.exported_splat_count;
+            }
+            event_and_text = Some((
+                event,
+                Some(format!(
+                    "terminal_export_validation source={} exported={} transforms_non_finite_rows={} sh_non_finite_rows={} opacity_non_finite_rows={}",
+                    report.original_splat_count,
+                    report.exported_splat_count,
+                    report.transforms_non_finite_row_count,
+                    report.sh_coeffs_non_finite_row_count,
+                    report.opacity_non_finite_row_count,
+                )),
+            ));
         }
         _ => {}
     }

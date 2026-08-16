@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use brush_c::{
     BRUSH_ABI_VERSION_V2, BRUSH_ABI_VERSION_V3, BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2,
-    BrushEventKindV2, BrushEventV2, BrushInitializerRouteV2, BrushNativeIdentityV2,
-    ProgressMessage, ProgressMessageKind, TrainExitCode, TrainOptions, TrainOptionsV2,
-    TrainOptionsV3, brush_get_abi_version, brush_get_native_identity_v2, brush_job_cancel,
-    brush_job_release, brush_job_release_v2, brush_job_retain_v2, brush_job_wait,
-    brush_job_wait_v2, brush_train_start, brush_train_start_v2, brush_train_start_v3,
-    train_and_save,
+    BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2, BrushEventKindV2, BrushEventV2,
+    BrushInitializerRouteV2, BrushNativeIdentityV2, ProgressMessage, ProgressMessageKind,
+    TrainExitCode, TrainOptions, TrainOptionsV2, TrainOptionsV3, brush_get_abi_version,
+    brush_get_native_identity_v2, brush_job_cancel, brush_job_release, brush_job_release_v2,
+    brush_job_retain_v2, brush_job_wait, brush_job_wait_v2, brush_train_start,
+    brush_train_start_v2, brush_train_start_v3, train_and_save,
 };
 
 #[repr(C)]
@@ -335,6 +335,7 @@ fn test_v2_strong_initializer_and_phase0_events() {
     assert_eq!(kinds.get(1), Some(&BrushEventKindV2::Configuration));
     assert_eq!(kinds.last(), Some(&BrushEventKindV2::Terminal));
     assert!(events[0].0.capability_flags & BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2 != 0);
+    assert!(events[0].0.capability_flags & BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2 != 0);
 
     let configuration = events
         .iter()
@@ -378,6 +379,19 @@ fn test_v2_strong_initializer_and_phase0_events() {
     assert!(events.iter().any(|event| {
         event.0.kind == BrushEventKindV2::CheckpointExported && event.0.iteration == 10
     }));
+    let terminal_compaction = events
+        .iter()
+        .find(|event| event.0.kind == BrushEventKindV2::TerminalCompaction)
+        .expect("missing terminal export validation telemetry");
+    assert_eq!(terminal_compaction.0.iteration, 10);
+    assert_eq!(terminal_compaction.0.primitive_count, 3);
+    assert_eq!(terminal_compaction.0.pruned_non_finite_count, 0);
+    assert!(
+        terminal_compaction
+            .1
+            .as_deref()
+            .is_some_and(|text| text.contains("terminal_export_validation source=3 exported=3"))
+    );
     let terminal = events.last().unwrap().0;
     assert_eq!(terminal.initial_primitive_count, 3);
     assert_eq!(terminal.final_primitive_count, 3);
