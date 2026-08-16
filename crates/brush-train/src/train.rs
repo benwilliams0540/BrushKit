@@ -68,6 +68,9 @@ pub struct SplatTrainer {
     /// Present only for callers that explicitly request deterministic host RNG.
     /// Legacy callers continue to use thread-local entropy exactly as before.
     deterministic_rng: Option<rand::rngs::StdRng>,
+    /// Adds host clocks around the three existing optimizer calls. Disabled by
+    /// default so ordinary callers retain the exact training path.
+    optimizer_substage_telemetry: bool,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -149,6 +152,7 @@ impl SplatTrainer {
             max_sh_degree: 0,
             view_cams: Vec::new(),
             deterministic_rng: None,
+            optimizer_substage_telemetry: false,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -162,6 +166,10 @@ impl SplatTrainer {
 
     pub fn set_deterministic_seed(&mut self, seed: Option<u64>) {
         self.deterministic_rng = seed.map(rand::rngs::StdRng::seed_from_u64);
+    }
+
+    pub fn set_optimizer_substage_telemetry(&mut self, enabled: bool) {
+        self.optimizer_substage_telemetry = enabled;
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
@@ -383,23 +391,35 @@ impl SplatTrainer {
             *optimizer = create_optimizer_from_config().load_record(record);
         }
 
+        let optimizer_substage_telemetry = self.optimizer_substage_telemetry;
         let optimizer_start = Instant::now();
+        let mut optimizer_transforms_duration = None;
+        let mut optimizer_sh_coeffs_duration = None;
+        let mut optimizer_opacity_duration = None;
         splats = trace_span!("Optimizer step").in_scope(|| {
+            let substage_start = optimizer_substage_telemetry.then(Instant::now);
             splats = trace_span!("Transforms step").in_scope(|| {
                 let grad_transforms =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.transforms.id]);
                 optimizer.step(1.0, splats, grad_transforms)
             });
+            optimizer_transforms_duration = substage_start.map(|start| start.elapsed());
+
+            let substage_start = optimizer_substage_telemetry.then(Instant::now);
             splats = trace_span!("SH Coeffs step").in_scope(|| {
                 let grad_coeff =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.sh_coeffs.id]);
                 optimizer.step(self.config.lr_coeffs_dc, splats, grad_coeff)
             });
+            optimizer_sh_coeffs_duration = substage_start.map(|start| start.elapsed());
+
+            let substage_start = optimizer_substage_telemetry.then(Instant::now);
             splats = trace_span!("Opacity step").in_scope(|| {
                 let grad_opac =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.raw_opacities.id]);
                 optimizer.step(self.config.lr_opac, splats, grad_opac)
             });
+            optimizer_opacity_duration = substage_start.map(|start| start.elapsed());
             splats
         });
         let optimizer_duration = optimizer_start.elapsed();
@@ -450,6 +470,9 @@ impl SplatTrainer {
             loss_duration,
             backward_duration,
             optimizer_duration,
+            optimizer_transforms_duration,
+            optimizer_sh_coeffs_duration,
+            optimizer_opacity_duration,
             loss: loss_inner,
         };
 

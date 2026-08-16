@@ -1437,6 +1437,9 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             loss_duration,
             backward_duration,
             optimizer_duration,
+            optimizer_transforms_duration,
+            optimizer_sh_coeffs_duration,
+            optimizer_opacity_duration,
             live_splat_count,
             ..
         }) => {
@@ -1456,7 +1459,19 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             {
                 *last_primitive_count = *live_splat_count;
             }
-            event_and_text = Some((event, None));
+            let optimizer_substage_text = optimizer_transforms_duration
+                .as_ref()
+                .zip(optimizer_sh_coeffs_duration.as_ref())
+                .zip(optimizer_opacity_duration.as_ref())
+                .map(|((transforms, sh_coeffs), opacity)| {
+                    format!(
+                        "optimizer_substages transforms_ns={} sh_coeffs_ns={} opacity_ns={}",
+                        duration_ns(*transforms),
+                        duration_ns(*sh_coeffs),
+                        duration_ns(*opacity),
+                    )
+                });
+            event_and_text = Some((event, optimizer_substage_text));
         }
         ProcessMessage::TrainMessage(TrainMessage::RefineStep {
             cur_splat_count,

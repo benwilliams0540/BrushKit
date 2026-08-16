@@ -31,6 +31,15 @@ pub struct TrainStepStats {
     pub backward_duration: Duration,
     /// Host-observed duration for optimizer command construction.
     pub optimizer_duration: Duration,
+    /// Host-observed duration for the transforms optimizer call. Present only
+    /// when the host explicitly enables optimizer-substage telemetry.
+    pub optimizer_transforms_duration: Option<Duration>,
+    /// Host-observed duration for the SH-coefficients optimizer call. Present
+    /// only when the host explicitly enables optimizer-substage telemetry.
+    pub optimizer_sh_coeffs_duration: Option<Duration>,
+    /// Host-observed duration for the opacity optimizer call. Present only
+    /// when the host explicitly enables optimizer-substage telemetry.
+    pub optimizer_opacity_duration: Option<Duration>,
     // Non-autodiff inner tensor; consumers read the scalar lazily so disabled
     // logging doesn't force a GPU readback.
     pub loss: Tensor<1>,

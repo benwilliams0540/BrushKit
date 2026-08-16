@@ -347,6 +347,7 @@ pub(crate) async fn train_stream(
     let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
     trainer.set_view_cams(view_cams.clone());
     trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
+    trainer.set_optimizer_substage_telemetry(train_stream_config.host_runtime.phase0_telemetry);
     if train_stream_config.host_runtime.phase0_telemetry {
         emitter
             .emit(ProcessMessage::TrainMessage(
@@ -471,6 +472,9 @@ pub(crate) async fn train_stream(
             trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
             trainer.set_view_cams(view_cams.clone());
             trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
+            trainer.set_optimizer_substage_telemetry(
+                train_stream_config.host_runtime.phase0_telemetry,
+            );
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -729,6 +733,9 @@ pub(crate) async fn train_stream(
                     loss_duration: stats.loss_duration,
                     backward_duration: stats.backward_duration,
                     optimizer_duration: stats.optimizer_duration,
+                    optimizer_transforms_duration: stats.optimizer_transforms_duration,
+                    optimizer_sh_coeffs_duration: stats.optimizer_sh_coeffs_duration,
+                    optimizer_opacity_duration: stats.optimizer_opacity_duration,
                     live_splat_count: refine.total_splats,
                     lod_progress,
                 }))

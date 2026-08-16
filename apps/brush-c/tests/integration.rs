@@ -373,6 +373,18 @@ fn test_v2_strong_initializer_and_phase0_events() {
         .collect();
     assert!(step_iterations.contains(&1));
     assert!(step_iterations.contains(&10));
+    assert!(
+        events
+            .iter()
+            .filter(|event| { event.0.kind == BrushEventKindV2::Step })
+            .all(|event| {
+                event.1.as_deref().is_some_and(|text| {
+                    text.starts_with("optimizer_substages transforms_ns=")
+                        && text.contains(" sh_coeffs_ns=")
+                        && text.contains(" opacity_ns=")
+                })
+            })
+    );
     assert!(events.iter().any(|event| {
         event.0.kind == BrushEventKindV2::CheckpointExportStarted && event.0.iteration == 10
     }));
@@ -395,6 +407,41 @@ fn test_v2_strong_initializer_and_phase0_events() {
     let terminal = events.last().unwrap().0;
     assert_eq!(terminal.initial_primitive_count, 3);
     assert_eq!(terminal.final_primitive_count, 3);
+}
+
+#[test]
+fn test_v2_optimizer_substage_telemetry_is_opt_in() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_v2_optimizer_telemetry_off_")
+        .tempdir()
+        .unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let mut options = v2_options(&output_path, &export_name, &initializer, 0);
+    options.total_train_steps = 1;
+    options.export_every = 1;
+    let mut state = V2CallbackState::default();
+
+    // SAFETY: callback state and all option strings outlive the blocking call.
+    let status = unsafe {
+        brush_c::train_and_save_v2(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert_eq!(status, TrainExitCode::Success);
+
+    let events = state.events.lock().unwrap();
+    let steps: Vec<_> = events
+        .iter()
+        .filter(|event| event.0.kind == BrushEventKindV2::Step)
+        .collect();
+    assert!(!steps.is_empty());
+    assert!(steps.iter().all(|event| event.1.is_none()));
 }
 
 #[test]
