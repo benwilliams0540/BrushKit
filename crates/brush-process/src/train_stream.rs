@@ -10,7 +10,11 @@ use crate::{
     wait_for_device,
 };
 use anyhow::Context;
-use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
+use brush_dataset::{
+    load_dataset,
+    scene::Scene,
+    scene_loader::{SceneLoader, SceneLoaderCache},
+};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_render::sh::sh_coeffs_for_degree;
 use brush_rerun::visualize_tools::VisualizeTools;
@@ -278,16 +282,29 @@ pub(crate) async fn train_stream(
         .host_runtime
         .deterministic_seed
         .unwrap_or(42);
-    let make_dataloader = |scene: &Scene| {
-        if train_stream_config
+    let make_dataloader = |scene: &Scene, cache: Option<&SceneLoaderCache>| match (
+        train_stream_config
             .host_runtime
             .deterministic_seed
-            .is_some()
-        {
+            .is_some(),
+        cache,
+    ) {
+        (true, Some(cache)) => SceneLoader::new_deterministic_with_cache(
+            scene,
+            dataloader_seed,
+            &train_stream_config.load_config,
+            cache,
+        ),
+        (true, None) => {
             SceneLoader::new_deterministic(scene, dataloader_seed, &train_stream_config.load_config)
-        } else {
-            SceneLoader::new(scene, dataloader_seed, &train_stream_config.load_config)
         }
+        (false, Some(cache)) => SceneLoader::new_with_cache(
+            scene,
+            dataloader_seed,
+            &train_stream_config.load_config,
+            cache,
+        ),
+        (false, None) => SceneLoader::new(scene, dataloader_seed, &train_stream_config.load_config),
     };
     let progressive_start_percent = train_stream_config
         .host_runtime
@@ -304,7 +321,12 @@ pub(crate) async fn train_stream(
             .clone()
             .with_image_scale(progressive_start_percent as f32 / 100.0)
     });
-    let mut dataloader = make_dataloader(progressive_scene.as_ref().unwrap_or(&dataset.train));
+    let mut dataloader =
+        make_dataloader(progressive_scene.as_ref().unwrap_or(&dataset.train), None);
+    let full_resolution_cache = progressive_resolution_enabled.then(|| {
+        log::info!("Progressive resolution: prefetching the full-resolution batch cache");
+        SceneLoaderCache::prefetch(&dataset.train, &train_stream_config.load_config)
+    });
     if progressive_resolution_enabled {
         log::info!(
             "Progressive resolution: {progressive_start_percent}% through iteration {}, then 100%",
@@ -368,7 +390,7 @@ pub(crate) async fn train_stream(
     log::info!("Start training loop.");
     for iter in process_config.start_iter..train_stream_config.train_config.total_iters() {
         if progressive_resolution_enabled && iter == progressive_switch_iteration {
-            dataloader = make_dataloader(&dataset.train);
+            dataloader = make_dataloader(&dataset.train, full_resolution_cache.as_ref());
             log::info!("Progressive resolution: switched to 100% at iteration {iter}");
         }
         let target_lod = if lod_levels == 0 || iter < training_steps {
@@ -440,9 +462,9 @@ pub(crate) async fn train_stream(
             let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
             dataloader = if lod_img_pct < 100 {
                 let lod_scene = dataset.train.clone().with_image_scale(cumulative_scale);
-                make_dataloader(&lod_scene)
+                make_dataloader(&lod_scene, None)
             } else {
-                make_dataloader(&dataset.train)
+                make_dataloader(&dataset.train, None)
             };
 
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
