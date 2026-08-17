@@ -73,8 +73,13 @@ jobs:
           test "$resolved_revision" = "$SOURCE_REVISION"
           git merge-base --is-ancestor "$SOURCE_REVISION" HEAD
           if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG"; then
-            echo "error: tag already exists: $RELEASE_TAG" >&2
-            exit 1
+            test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+            release_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+            tagged_revision="$(git rev-list -1 "$release_commit" -- Cargo.toml Cargo.lock apps/brush-c crates)"
+            test "$tagged_revision" = "$SOURCE_REVISION"
+            git merge-base --is-ancestor "$SOURCE_REVISION" "$release_commit"
+            echo "Verified existing immutable tag $RELEASE_TAG at $release_commit"
+            exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -84,15 +89,20 @@ jobs:
 
   brushkit-ffi-release:
     name: Build and publish BrushKit FFI XCFramework
-    if: ${{ startsWith(github.ref_name, 'brushkit-ffi-v') }}
+    needs:
+      - prepare-brushkit-ffi-release
+    if: ${{ always() && (startsWith(github.ref_name, 'brushkit-ffi-v') || (github.event_name == 'workflow_dispatch' && needs.prepare-brushkit-ffi-release.result == 'success')) }}
     runs-on: "macos-15"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      EXPECTED_SOURCE_REVISION: ${{ github.event_name == 'workflow_dispatch' && inputs.source_revision || '' }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
           submodules: recursive
       - name: Install release toolchain
         run: |
@@ -107,6 +117,9 @@ jobs:
           source_revision="$(git rev-list -1 HEAD -- Cargo.toml Cargo.lock apps/brush-c crates)"
           test -n "$source_revision"
           git merge-base --is-ancestor "$source_revision" HEAD
+          if [[ -n "$EXPECTED_SOURCE_REVISION" ]]; then
+            test "$source_revision" = "$EXPECTED_SOURCE_REVISION"
+          fi
           echo "BRUSHKIT_BUILD_REVISION=$source_revision" >> "$GITHUB_ENV"
       - name: Build profiler-off Apple XCFramework
         run: |
@@ -142,7 +155,7 @@ jobs:
       - name: Preserve workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: BrushKitFFI-${{ github.ref_name }}
+          name: BrushKitFFI-${{ env.RELEASE_TAG }}
           path: artifacts/BrushKitFFI.xcframework.zip
           if-no-files-found: error
       - name: Create GitHub release
@@ -150,11 +163,12 @@ jobs:
           SWIFTPM_CHECKSUM: ${{ steps.validate.outputs.checksum }}
           ARCHIVE_SHA256: ${{ steps.validate.outputs.archive_sha256 }}
         run: |
-          version="${GITHUB_REF_NAME#brushkit-ffi-}"
-          gh release create "$GITHUB_REF_NAME" \
+          version="${RELEASE_TAG#brushkit-ffi-}"
+          release_commit="$(git rev-parse HEAD)"
+          gh release create "$RELEASE_TAG" \
             artifacts/BrushKitFFI.xcframework.zip \
             --verify-tag \
-            --target "$GITHUB_SHA" \
+            --target "$release_commit" \
             --latest \
             --title "BrushKit FFI $version" \
             --notes "Profiler-off native BrushKit FFI built from source revision \`$BRUSHKIT_BUILD_REVISION\`.
