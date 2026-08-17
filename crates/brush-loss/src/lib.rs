@@ -72,26 +72,29 @@ mod kernels {
     const HALO: u32 = 5;
     const SHARED_X: u32 = BLOCK_X + 2 * HALO; // 26
     const SHARED_Y: u32 = BLOCK_Y + 2 * HALO; // 26
-    // The backward kernel uses a smaller tile than the forward. Its inner
-    // blur of an already-blurred quantity widens the loaded `(pred, gt_eff)`
-    // footprint by another HALO on each side, so a 16x16 tile would need
-    // ~28 KiB of f32 shared memory; cubecl-wgpu's shared-memory limit check
-    // pessimistically doubles that and rejects the launch on Apple's 32 KiB
-    // threadgroup budget. Shrinking the tile to 8x8 fits inside the doubled
-    // bound. Forward is unaffected and stays at 16x16.
+    // Backward historically used 8x8 after an older cubecl-wgpu revision
+    // accidentally counted each shared allocation twice. The currently pinned
+    // CubeCL ba103c7 fixes that owning-layer bug. Keep the 16x16 candidate
+    // default-off until physical A/B evidence establishes a trainer-wall win.
+    #[cfg(feature = "image-loss-bwd-tile-16")]
+    pub const BLOCK_X_BWD: u32 = 16;
+    #[cfg(not(feature = "image-loss-bwd-tile-16"))]
     pub const BLOCK_X_BWD: u32 = 8;
+    #[cfg(feature = "image-loss-bwd-tile-16")]
+    pub const BLOCK_Y_BWD: u32 = 16;
+    #[cfg(not(feature = "image-loss-bwd-tile-16"))]
     pub const BLOCK_Y_BWD: u32 = 8;
-    const SHARED_X_BWD: u32 = BLOCK_X_BWD + 2 * HALO; // 18
-    const SHARED_Y_BWD: u32 = BLOCK_Y_BWD + 2 * HALO; // 18
-    const EXT_X_BWD: u32 = BLOCK_X_BWD + 4 * HALO; // 28
-    const EXT_Y_BWD: u32 = BLOCK_Y_BWD + 4 * HALO; // 28
+    const SHARED_X_BWD: u32 = BLOCK_X_BWD + 2 * HALO;
+    const SHARED_Y_BWD: u32 = BLOCK_Y_BWD + 2 * HALO;
+    const EXT_X_BWD: u32 = BLOCK_X_BWD + 4 * HALO;
+    const EXT_Y_BWD: u32 = BLOCK_Y_BWD + 4 * HALO;
     // Loop trip counts for cooperative loads/stores. Each phase needs at
     // least `ceil(footprint / threads)` iterations.
     const THREADS_BWD: u32 = BLOCK_X_BWD * BLOCK_Y_BWD;
-    const LOAD_ITERS_BWD: u32 = (EXT_Y_BWD * EXT_X_BWD).div_ceil(THREADS_BWD); // 13
-    const HBLUR_ITERS_BWD: u32 = (EXT_Y_BWD * SHARED_X_BWD).div_ceil(THREADS_BWD); // 8
-    const PARTIAL_ITERS_BWD: u32 = (SHARED_Y_BWD * SHARED_X_BWD).div_ceil(THREADS_BWD); // 6
-    const INNER_H_PASSES_BWD: u32 = SHARED_Y_BWD.div_ceil(BLOCK_Y_BWD); // 3
+    const LOAD_ITERS_BWD: u32 = (EXT_Y_BWD * EXT_X_BWD).div_ceil(THREADS_BWD);
+    const HBLUR_ITERS_BWD: u32 = (EXT_Y_BWD * SHARED_X_BWD).div_ceil(THREADS_BWD);
+    const PARTIAL_ITERS_BWD: u32 = (SHARED_Y_BWD * SHARED_X_BWD).div_ceil(THREADS_BWD);
+    const INNER_H_PASSES_BWD: u32 = SHARED_Y_BWD.div_ceil(BLOCK_Y_BWD);
 
     const C1: f32 = 0.01 * 0.01;
     const C2: f32 = 0.03 * 0.03;
@@ -360,12 +363,9 @@ mod kernels {
 
     /// Backward: recompute SSIM partials inline, scatter `dL/dpred` per pixel.
     ///
-    /// Each `sync_cube` boundary frees a scratch role, so the four logical
-    /// arrays alias into two physical buffers. Tile is 8x8 (rather than 16x16
-    /// like the forward) because cubecl-wgpu's shared-memory limit check
-    /// reports double the bytes actually declared in WGSL, and the 16x16
-    /// layout's ~28 KiB would trip Apple's 32 KiB threadgroup limit under
-    /// that doubled accounting.
+    /// The two declared f32 scratch arrays consume 15,680 bytes at 8x8 or
+    /// 29,088 bytes at 16x16. The larger candidate remains below Apple's
+    /// reported 32 KiB workgroup-storage limit and always uses checked launch.
     #[allow(clippy::assign_op_pattern)]
     #[cube(launch)]
     pub fn image_loss_backward_kernel<F: Float>(
