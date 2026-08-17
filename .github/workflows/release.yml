@@ -45,8 +45,95 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  brushkit-ffi-release:
+    name: Build and publish BrushKit FFI XCFramework
+    if: ${{ startsWith(github.ref_name, 'brushkit-ffi-v') }}
+    runs-on: "macos-15"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - name: Install release toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal \
+            --target aarch64-apple-darwin \
+            --target aarch64-apple-ios \
+            --target aarch64-apple-ios-sim
+          rustup default 1.95.0
+          cargo install cbindgen --version 0.29.4 --locked
+      - name: Resolve engine source revision
+        run: |
+          source_revision="$(git rev-list -1 HEAD -- Cargo.toml Cargo.lock apps/brush-c crates)"
+          test "$source_revision" = "$(git rev-parse HEAD^)"
+          echo "BRUSHKIT_BUILD_REVISION=$source_revision" >> "$GITHUB_ENV"
+      - name: Build profiler-off Apple XCFramework
+        run: |
+          env -u BRUSHKIT_CUBECL_GPU_PROFILE \
+            BRUSHKIT_BUILD_REVISION="$BRUSHKIT_BUILD_REVISION" \
+            ./scripts/build_brushkit_xcframework.sh
+      - name: Validate ABI, slices, identity, and archive
+        id: validate
+        run: |
+          test "$(plutil -extract AvailableLibraries.0.SupportedArchitectures.0 raw artifacts/BrushKitFFI.xcframework/Info.plist)" = "arm64"
+          test "$(plutil -extract AvailableLibraries.1.SupportedArchitectures.0 raw artifacts/BrushKitFFI.xcframework/Info.plist)" = "arm64"
+          test "$(plutil -extract AvailableLibraries.2.SupportedArchitectures.0 raw artifacts/BrushKitFFI.xcframework/Info.plist)" = "arm64"
+
+          for library in artifacts/BrushKitFFI.xcframework/*/libbrush_c.a; do
+            xcrun lipo -verify_arch arm64 "$library"
+            grep -a -q "$BRUSHKIT_BUILD_REVISION" "$library"
+            if grep -a -q "basic_stdout_device_if_supported" "$library"; then
+              echo "error: CubeCL GPU profiler marker is present in $library" >&2
+              exit 1
+            fi
+          done
+
+          xcrun clang -std=c11 -fsyntax-only \
+            -I artifacts/BrushKitFFI.xcframework/macos-arm64/Headers \
+            apps/brush-c/tests/abi_v021_compat.c
+          unzip -t artifacts/BrushKitFFI.xcframework.zip
+
+          checksum="$(swift package compute-checksum artifacts/BrushKitFFI.xcframework.zip)"
+          archive_sha256="$(shasum -a 256 artifacts/BrushKitFFI.xcframework.zip | awk '{print $1}')"
+          test "$checksum" = "$archive_sha256"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "archive_sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+      - name: Preserve workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: BrushKitFFI-${{ github.ref_name }}
+          path: artifacts/BrushKitFFI.xcframework.zip
+          if-no-files-found: error
+      - name: Create GitHub release
+        env:
+          SWIFTPM_CHECKSUM: ${{ steps.validate.outputs.checksum }}
+          ARCHIVE_SHA256: ${{ steps.validate.outputs.archive_sha256 }}
+        run: |
+          version="${GITHUB_REF_NAME#brushkit-ffi-}"
+          gh release create "$GITHUB_REF_NAME" \
+            artifacts/BrushKitFFI.xcframework.zip \
+            --verify-tag \
+            --target "$GITHUB_SHA" \
+            --latest \
+            --title "BrushKit FFI $version" \
+            --notes "Profiler-off native BrushKit FFI built from source revision \`$BRUSHKIT_BUILD_REVISION\`.
+
+          Apple slices:
+          - macOS arm64
+          - iOS arm64
+          - iOS Simulator arm64
+
+          Callable ABI version: 2. Additive V3 training entry point included. Legacy v0.2.1 entry points remain available.
+
+          SwiftPM checksum: \`$SWIFTPM_CHECKSUM\`
+          Archive SHA-256: \`$ARCHIVE_SHA256\`"
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    if: ${{ !startsWith(github.ref_name, 'brushkit-ffi-v') }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
