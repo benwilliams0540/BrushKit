@@ -6,6 +6,10 @@ use brush_process::config::{HostRuntimeConfig, TrainStreamConfig};
 use brush_process::message::{InitializerRoute, TelemetryBoundary, TrainMessage};
 use brush_process::{DataSource, create_process, message::ProcessMessage};
 use brush_render::gaussian_splats::SplatRenderMode;
+#[cfg(brushkit_cubecl_gpu_profile)]
+use burn_cubecl::cubecl::config::{
+    CubeClRuntimeConfig, RuntimeConfig, profiling::ProfilingLogLevel,
+};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::path::PathBuf;
@@ -1191,6 +1195,7 @@ fn run_training_job_with_config(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
+        configure_cubecl_gpu_profile(process_args.host_runtime.phase0_telemetry);
         let source = DataSource::Path(dataset_path);
         let mut process = create_process(source, async move |_| Some(process_args));
 
@@ -1258,6 +1263,27 @@ fn run_training_job_with_config(
     emit_v2_terminal(&callback, status, error_code, detail.as_deref());
     status
 }
+
+#[cfg(brushkit_cubecl_gpu_profile)]
+fn configure_cubecl_gpu_profile(phase0_telemetry_requested: bool) {
+    use std::sync::Once;
+
+    if !phase0_telemetry_requested {
+        return;
+    }
+
+    static CONFIGURE_ONCE: Once = Once::new();
+    CONFIGURE_ONCE.call_once(|| {
+        let mut config = CubeClRuntimeConfig::default();
+        config.profiling.logger.level = ProfilingLogLevel::Basic;
+        config.profiling.logger.stdout = true;
+        CubeClRuntimeConfig::set(config);
+        println!("BRUSHKIT_CUBECL_GPU_PROFILE=basic_stdout_device_if_supported");
+    });
+}
+
+#[cfg(not(brushkit_cubecl_gpu_profile))]
+fn configure_cubecl_gpu_profile(_phase0_telemetry_requested: bool) {}
 
 fn emit_progress_message(message: ProcessMessage, callback: &mut JobCallback) {
     if matches!(callback, JobCallback::V2 { .. }) {

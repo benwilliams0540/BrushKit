@@ -3,6 +3,12 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-env-changed=BRUSHKIT_BUILD_REVISION");
+    println!("cargo:rerun-if-env-changed=BRUSHKIT_CUBECL_GPU_PROFILE");
+    println!("cargo:rustc-check-cfg=cfg(brushkit_cubecl_gpu_profile)");
+
+    if std::env::var("BRUSHKIT_CUBECL_GPU_PROFILE").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=brushkit_cubecl_gpu_profile");
+    }
 
     if let Ok(output) = Command::new("git")
         .args(["symbolic-ref", "-q", "HEAD"])

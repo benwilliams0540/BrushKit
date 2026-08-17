@@ -10,6 +10,7 @@ name = "brush_c"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
+burn-cubecl.workspace = true
 brush-process = { path = "../../crates/brush-process", default-features = false }
 brush-render = { path = "../../crates/brush-render" }
 

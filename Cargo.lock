@@ -935,6 +935,7 @@ dependencies = [
  "brush-process",
  "brush-render",
  "brush-serde",
+ "burn-cubecl",
  "tempfile",
  "tokio",
  "tokio-stream",
