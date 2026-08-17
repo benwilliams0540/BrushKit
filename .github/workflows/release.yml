@@ -134,7 +134,7 @@ jobs:
           test "$(plutil -extract AvailableLibraries.2.SupportedArchitectures.0 raw artifacts/BrushKitFFI.xcframework/Info.plist)" = "arm64"
 
           for library in artifacts/BrushKitFFI.xcframework/*/libbrush_c.a; do
-            xcrun lipo -verify_arch arm64 "$library"
+            xcrun lipo "$library" -verify_arch arm64
             grep -a -q "$BRUSHKIT_BUILD_REVISION" "$library"
             if grep -a -q "basic_stdout_device_if_supported" "$library"; then
               echo "error: CubeCL GPU profiler marker is present in $library" >&2
