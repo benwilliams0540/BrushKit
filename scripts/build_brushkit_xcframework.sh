@@ -8,6 +8,7 @@ build_root="$repo_root/target/brushkit-ffi"
 include_dir="$build_root/include"
 output_dir="$repo_root/artifacts/$artifact_name.xcframework"
 zip_path="$repo_root/artifacts/$artifact_name.xcframework.zip"
+cargo_features="${BRUSHKIT_CARGO_FEATURES:-}"
 
 if ! command -v cbindgen >/dev/null 2>&1; then
   echo "error: cbindgen is required. Install it with: cargo install cbindgen --locked" >&2
@@ -33,7 +34,11 @@ for target in $targets; do
   source_lib="$repo_root/target/$target/release/libbrush_c.a"
   stripped_lib="$build_dir/libbrush_c.a"
 
-  cargo build -p brush-c --release --target "$target"
+  cargo_args=(build -p brush-c --release --target "$target")
+  if [[ -n "$cargo_features" ]]; then
+    cargo_args+=(--features "$cargo_features")
+  fi
+  cargo "${cargo_args[@]}"
 
   mkdir -p "$build_dir"
   cp "$source_lib" "$stripped_lib"
