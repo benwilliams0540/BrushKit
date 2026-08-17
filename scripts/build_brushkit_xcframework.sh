@@ -4,10 +4,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 artifact_name="BrushKitFFI"
 targets="${BRUSHKIT_TARGETS:-${BRUSHKIT_TARGET:-aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim}}"
+artifact_root="${BRUSHKIT_ARTIFACT_OUTPUT_ROOT:-$repo_root/artifacts}"
 build_root="$repo_root/target/brushkit-ffi"
 include_dir="$build_root/include"
-output_dir="$repo_root/artifacts/$artifact_name.xcframework"
-zip_path="$repo_root/artifacts/$artifact_name.xcframework.zip"
+output_dir="$artifact_root/$artifact_name.xcframework"
+zip_path="$artifact_root/$artifact_name.xcframework.zip"
 cargo_features="${BRUSHKIT_CARGO_FEATURES:-}"
 
 if ! command -v cbindgen >/dev/null 2>&1; then
@@ -15,7 +16,7 @@ if ! command -v cbindgen >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$include_dir"
+mkdir -p "$include_dir" "$artifact_root"
 
 cbindgen "$repo_root/apps/brush-c" \
   --config "$repo_root/apps/brush-c/cbindgen.toml" \
