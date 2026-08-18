@@ -45,6 +45,7 @@ include = [
   "BRUSH_INITIALIZER_FIELD_OPACITY_V2",
   "BRUSH_INITIALIZER_FIELD_SH_V2",
   "brush_get_abi_version",
+  "brush_get_build_provenance_v1",
   "brush_get_native_identity_v2",
   "brush_train_start_v2",
   "brush_train_start_v3",

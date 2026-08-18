@@ -97,6 +97,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
       EXPECTED_SOURCE_REVISION: ${{ github.event_name == 'workflow_dispatch' && inputs.source_revision || '' }}
+      RELEASE_CARGO_FEATURES: image-loss-bwd-tile-16
     steps:
       - uses: actions/checkout@v6
         with:
@@ -125,6 +126,7 @@ jobs:
         run: |
           env -u BRUSHKIT_CUBECL_GPU_PROFILE \
             BRUSHKIT_BUILD_REVISION="$BRUSHKIT_BUILD_REVISION" \
+            BRUSHKIT_CARGO_FEATURES="$RELEASE_CARGO_FEATURES" \
             ./scripts/build_brushkit_xcframework.sh
       - name: Validate ABI, slices, identity, and archive
         id: validate
@@ -133,9 +135,23 @@ jobs:
           test "$(plutil -extract AvailableLibraries.1.SupportedArchitectures.0 raw artifacts/BrushKitFFI.xcframework/Info.plist)" = "arm64"
           test "$(plutil -extract AvailableLibraries.2.SupportedArchitectures.0 raw artifacts/BrushKitFFI.xcframework/Info.plist)" = "arm64"
 
+          provenance="artifacts/BrushKitFFI.xcframework/BrushKitFFI.provenance.txt"
+          test -f "$provenance"
+          grep -Fxq "engine_source_sha=$BRUSHKIT_BUILD_REVISION" "$provenance"
+          grep -Fxq "crate_version=${RELEASE_TAG#brushkit-ffi-v}" "$provenance"
+          grep -Fxq 'callable_abi=2' "$provenance"
+          grep -Fxq 'additive_train_abi=3' "$provenance"
+          grep -Fxq "apple_features=$RELEASE_CARGO_FEATURES" "$provenance"
+          grep -Fxq 'cubecl_gpu_profile=off' "$provenance"
+          grep -Fq 'rustc=rustc 1.95.0 ' "$provenance"
+          grep -Fxq 'targets=aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim' "$provenance"
+
           for library in artifacts/BrushKitFFI.xcframework/*/libbrush_c.a; do
             xcrun lipo "$library" -verify_arch arm64
             grep -a -q "$BRUSHKIT_BUILD_REVISION" "$library"
+            grep -a -q 'format=brushkit-build-provenance-v1;' "$library"
+            grep -a -q "apple_features=$RELEASE_CARGO_FEATURES" "$library"
+            grep -a -q 'cubecl_gpu_profile=off;' "$library"
             if grep -a -q "basic_stdout_device_if_supported" "$library"; then
               echo "error: CubeCL GPU profiler marker is present in $library" >&2
               exit 1
@@ -145,6 +161,17 @@ jobs:
           xcrun clang -std=c11 -fsyntax-only \
             -I artifacts/BrushKitFFI.xcframework/macos-arm64/Headers \
             apps/brush-c/tests/abi_v021_compat.c
+          xcrun clang -std=c11 \
+            -I artifacts/BrushKitFFI.xcframework/macos-arm64/Headers \
+            apps/brush-c/tests/abi_release_identity.c \
+            artifacts/BrushKitFFI.xcframework/macos-arm64/libbrush_c.a \
+            -framework QuartzCore -framework Metal -framework Foundation \
+            -framework CoreFoundation -lobjc -liconv -lc -lm \
+            -o artifacts/brushkit-release-identity-smoke
+          artifacts/brushkit-release-identity-smoke \
+            "$BRUSHKIT_BUILD_REVISION" \
+            "${RELEASE_TAG#brushkit-ffi-v}" \
+            "apple_features=$RELEASE_CARGO_FEATURES"
           unzip -t artifacts/BrushKitFFI.xcframework.zip
 
           checksum="$(swift package compute-checksum artifacts/BrushKitFFI.xcframework.zip)"
@@ -179,6 +206,8 @@ jobs:
           - iOS Simulator arm64
 
           Callable ABI version: 2. Additive V3 training entry point included. Legacy v0.2.1 entry points remain available.
+
+          Apple artifact feature set: \`$RELEASE_CARGO_FEATURES\`. CubeCL GPU profiler: off. Immutable build provenance is embedded in each native slice and recorded in \`BrushKitFFI.provenance.txt\`.
 
           SwiftPM checksum: \`$SWIFTPM_CHECKSUM\`
           Archive SHA-256: \`$ARCHIVE_SHA256\`"

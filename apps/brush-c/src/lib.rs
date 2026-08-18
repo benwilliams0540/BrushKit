@@ -635,6 +635,7 @@ static SETUP: OnceCell<()> = OnceCell::const_new();
 static V2_TRAINING_LOCK: Mutex<()> = Mutex::new(());
 
 const BUILD_REVISION_C: &[u8] = concat!(env!("BRUSHKIT_BUILD_REVISION"), "\0").as_bytes();
+const BUILD_PROVENANCE_C: &[u8] = concat!(env!("BRUSHKIT_BUILD_PROVENANCE"), "\0").as_bytes();
 const CRATE_VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 #[cfg(target_vendor = "apple")]
 const GRAPHICS_BACKEND_C: &[u8] = b"Metal\0";
@@ -646,6 +647,15 @@ const ADAPTER_UNAVAILABLE_C: &[u8] =
 #[unsafe(no_mangle)]
 pub extern "C" fn brush_get_abi_version() -> u32 {
     BRUSH_ABI_VERSION_V2
+}
+
+/// Returns a stable, process-lifetime, semicolon-delimited provenance record.
+/// The record is generated from compile-time state and includes the engine
+/// revision, crate version, ABI versions, enabled Apple feature set, profiler
+/// state, Rust toolchain, and target triple.
+#[unsafe(no_mangle)]
+pub extern "C" fn brush_get_build_provenance_v1() -> *const c_char {
+    BUILD_PROVENANCE_C.as_ptr().cast()
 }
 
 /// Copies stable, process-lifetime native identity pointers into `identity`.

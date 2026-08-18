@@ -12,9 +12,10 @@ use brush_c::{
     BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2, BrushEventKindV2, BrushEventV2,
     BrushInitializerRouteV2, BrushNativeIdentityV2, ProgressMessage, ProgressMessageKind,
     TrainExitCode, TrainOptions, TrainOptionsV2, TrainOptionsV3, brush_get_abi_version,
-    brush_get_native_identity_v2, brush_job_cancel, brush_job_release, brush_job_release_v2,
-    brush_job_retain_v2, brush_job_wait, brush_job_wait_v2, brush_train_start,
-    brush_train_start_v2, brush_train_start_v3, train_and_save,
+    brush_get_build_provenance_v1, brush_get_native_identity_v2, brush_job_cancel,
+    brush_job_release, brush_job_release_v2, brush_job_retain_v2, brush_job_wait,
+    brush_job_wait_v2, brush_train_start, brush_train_start_v2, brush_train_start_v3,
+    train_and_save,
 };
 
 #[repr(C)]
@@ -212,6 +213,22 @@ fn test_v2_abi_identity_is_explicit() {
     assert!(!identity.graphics_backend.is_null());
     assert!(!identity.adapter_name.is_null());
     assert!(!identity.adapter_identity_available);
+
+    let provenance = brush_get_build_provenance_v1();
+    assert!(!provenance.is_null());
+    // SAFETY: provenance is a process-lifetime, null-terminated static string.
+    let provenance = unsafe { CStr::from_ptr(provenance) }.to_str().unwrap();
+    assert!(provenance.starts_with("format=brushkit-build-provenance-v1;"));
+    assert!(provenance.contains(";callable_abi=2;additive_train_abi=3;"));
+    assert!(provenance.contains(concat!(";crate_version=", env!("CARGO_PKG_VERSION"), ";")));
+    assert!(provenance.contains(";cubecl_gpu_profile=off;"));
+    assert!(provenance.contains(";rustc=rustc "));
+    assert!(provenance.contains(";target="));
+    if cfg!(feature = "image-loss-bwd-tile-16") {
+        assert!(provenance.contains(";apple_features=image-loss-bwd-tile-16;"));
+    } else {
+        assert!(provenance.contains(";apple_features=none;"));
+    }
 }
 
 #[test]

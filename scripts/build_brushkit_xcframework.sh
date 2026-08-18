@@ -10,6 +10,16 @@ include_dir="$build_root/include"
 output_dir="$artifact_root/$artifact_name.xcframework"
 zip_path="$artifact_root/$artifact_name.xcframework.zip"
 cargo_features="${BRUSHKIT_CARGO_FEATURES:-}"
+build_revision="${BRUSHKIT_BUILD_REVISION:-unknown}"
+workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
+cubecl_gpu_profile="off"
+if [[ "${BRUSHKIT_CUBECL_GPU_PROFILE:-}" == "1" ]]; then
+  cubecl_gpu_profile="on"
+fi
+rustc_version="$(rustc --version)"
+cargo_version="$(cargo --version)"
+cbindgen_version="$(cbindgen --version)"
+xcode_version="$(xcodebuild -version | paste -sd ' ' -)"
 
 if ! command -v cbindgen >/dev/null 2>&1; then
   echo "error: cbindgen is required. Install it with: cargo install cbindgen --locked" >&2
@@ -59,6 +69,21 @@ rm -rf "$output_dir"
 xcodebuild -create-xcframework \
   "${xcframework_args[@]}" \
   -output "$output_dir"
+
+printf '%s\n' \
+  'format=brushkit-xcframework-provenance-v1' \
+  "engine_source_sha=$build_revision" \
+  "crate_version=$workspace_version" \
+  'callable_abi=2' \
+  'additive_train_abi=3' \
+  "apple_features=${cargo_features:-none}" \
+  "cubecl_gpu_profile=$cubecl_gpu_profile" \
+  "rustc=$rustc_version" \
+  "cargo=$cargo_version" \
+  "cbindgen=$cbindgen_version" \
+  "xcode=$xcode_version" \
+  "targets=$targets" \
+  > "$output_dir/BrushKitFFI.provenance.txt"
 
 du -sh "$output_dir"
 
