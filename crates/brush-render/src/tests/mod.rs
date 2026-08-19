@@ -6,7 +6,7 @@ use crate::kernels::camera_model::thin_prism_fisheye::ThinPrismFisheyeParams;
 use crate::{
     TextureMode,
     camera::Camera,
-    gaussian_splats::{SplatRenderMode, Splats, render_splats},
+    gaussian_splats::{SplatRenderMode, Splats, fold_min_scale, render_splats},
 };
 use assert_approx_eq::assert_approx_eq;
 use burn::tensor::{Distribution, Tensor};
@@ -68,6 +68,89 @@ async fn renders_at_all() {
         .expect("Wrong type")[0];
     assert_approx_eq!(rgb_mean, 0.0, 1e-5);
     assert_approx_eq!(alpha_mean, 0.0);
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn mip_scale_floor_has_finite_gradients_for_od5r_small_scales() {
+    let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+    let transform_values: [f32; 10] = [
+        2.1940124,
+        -0.7718716,
+        -2.257184,
+        0.8108415,
+        0.18011516,
+        -0.42028058,
+        0.4507918,
+        -7.1826057,
+        -6.9752913,
+        -8.430021,
+    ];
+    let transforms = crate::burn_glue::lift_to_autodiff(
+        Tensor::<1>::from_floats(transform_values, &device).reshape([1, 10]),
+    )
+    .require_grad();
+    let raw_opacities =
+        crate::burn_glue::lift_to_autodiff(Tensor::<1>::from_floats([0.0], &device)).require_grad();
+    let min_scale = Tensor::<1>::from_floats([0.00024539456], &device);
+
+    let (folded_transforms, folded_raw_opacities) =
+        fold_min_scale(transforms.clone(), raw_opacities, min_scale);
+    let folded_raw_opacity = folded_raw_opacities
+        .clone()
+        .into_data_async()
+        .await
+        .expect("folded opacity readback")
+        .to_vec::<f32>()
+        .expect("folded opacity values")[0];
+    let folded_values = folded_transforms
+        .clone()
+        .into_data_async()
+        .await
+        .expect("folded transform readback")
+        .to_vec::<f32>()
+        .expect("folded transform values");
+    let expected_folded_scales = [-7.132981, -6.9419637, -8.021322];
+    for (axis, expected) in expected_folded_scales.iter().copied().enumerate() {
+        assert_approx_eq!(folded_values[7 + axis], expected, 2.0e-6);
+    }
+    let floor_squared = 0.00024539456f32.powi(2);
+    let squared_scales = transform_values[7..10]
+        .iter()
+        .map(|log_scale| (2.0 * log_scale).exp())
+        .collect::<Vec<_>>();
+    let coefficient = squared_scales
+        .iter()
+        .map(|squared_scale| squared_scale / (squared_scale + floor_squared))
+        .product::<f32>()
+        .sqrt();
+    let expected_opacity = 0.5 * coefficient;
+    let expected_raw_opacity = (expected_opacity / (1.0 - expected_opacity)).ln();
+    assert_approx_eq!(folded_raw_opacity, expected_raw_opacity, 5.0e-6);
+
+    let loss = folded_transforms.sum() + folded_raw_opacities.sum();
+    let gradients = loss.backward();
+    let transform_gradient = transforms
+        .grad(&gradients)
+        .expect("missing transform gradient")
+        .into_data_async()
+        .await
+        .expect("transform gradient readback")
+        .to_vec::<f32>()
+        .expect("transform gradient values");
+    let scale_gradients = &transform_gradient[7..10];
+    assert!(
+        scale_gradients.iter().all(|value| value.is_finite()),
+        "Mip scale-floor gradient must stay finite for the OD5R boundary: {scale_gradients:?}"
+    );
+    assert!(
+        scale_gradients.iter().all(|value| value.abs() > 1.0e-6),
+        "Mip scale-floor gradient unexpectedly vanished: {scale_gradients:?}"
+    );
+    for (axis, actual) in scale_gradients.iter().copied().enumerate() {
+        let scale_fraction = squared_scales[axis] / (squared_scales[axis] + floor_squared);
+        let expected = scale_fraction + (1.0 - scale_fraction) / (1.0 - expected_opacity);
+        assert_approx_eq!(actual, expected, 2.0e-5);
+    }
 }
 
 #[wasm_bindgen_test(unsupported = tokio::test)]

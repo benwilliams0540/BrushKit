@@ -93,6 +93,7 @@ pub fn fold_min_scale(
     let f = crate::burn_glue::match_backend(f, &transforms);
     let n = transforms.dims()[0] as i32;
     let log_scales = transforms.clone().slice(s![.., 7..10]); // [N,3]
+    let log_det_s2 = log_scales.clone().mul_scalar(2.0).sum_dim(1); // log(det(s²)) [N,1]
     let s2 = log_scales.mul_scalar(2.0).exp(); // s² = exp(2·log) [N,3]
     let f2 = f.clone().mul(f).reshape([n, 1]); // [N,1]
     let s2f = s2.clone().add(f2); // s² + f² [N,3]
@@ -100,10 +101,16 @@ pub fn fold_min_scale(
     let new_log = s2f.clone().log().mul_scalar(0.5); // log(sqrt(s²+f²)) [N,3]
     let transforms = transforms.slice_assign(s![.., 7..10], new_log);
 
-    let det = |t: Tensor<2>| {
-        t.clone().slice(s![.., 0..1]) * t.clone().slice(s![.., 1..2]) * t.slice(s![.., 2..3])
-    };
-    let coef = (det(s2).div(det(s2f))).sqrt().reshape([n]); // sqrt(det1/det2) [N]
+    // Evaluate sqrt(det(s²) / det(s² + f²)) in log space. The direct quotient's
+    // autodiff divides by det(s² + f²)²; that intermediate underflows for valid
+    // OD5R-scale splats even though the algebraically simplified gradient is
+    // finite. This expression preserves the exact filter mathematics without
+    // the unstable squared determinant.
+    let log_det_s2f = s2f.clone().log().sum_dim(1);
+    let coef = (log_det_s2 - log_det_s2f)
+        .mul_scalar(0.5)
+        .exp()
+        .reshape([n]); // sqrt(det1/det2) [N]
     let opac = sigmoid(raw_opac).mul(coef).clamp(1e-6, 1.0 - 1e-6);
     let raw_opac = opac.clone().div(opac.neg().add_scalar(1.0)).log(); // logit
 
