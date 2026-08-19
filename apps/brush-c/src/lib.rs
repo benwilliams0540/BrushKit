@@ -628,6 +628,7 @@ enum JobCallback {
         started: Instant,
         initial_primitive_count: u32,
         last_primitive_count: u32,
+        terminal_exported_primitive_count: Option<u32>,
     },
 }
 
@@ -812,6 +813,7 @@ pub unsafe extern "C" fn brush_train_start_v2(
                     started,
                     initial_primitive_count: 0,
                     last_primitive_count: 0,
+                    terminal_exported_primitive_count: None,
                 },
                 &worker_cancellation,
             )
@@ -897,6 +899,7 @@ pub unsafe extern "C" fn brush_train_start_v3(
                     started,
                     initial_primitive_count: 0,
                     last_primitive_count: 0,
+                    terminal_exported_primitive_count: None,
                 },
                 &worker_cancellation,
             )
@@ -1451,11 +1454,13 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             if let JobCallback::V2 {
                 initial_primitive_count,
                 last_primitive_count,
+                terminal_exported_primitive_count,
                 ..
             } = callback
             {
                 *initial_primitive_count = report.primitive_count;
                 *last_primitive_count = report.primitive_count;
+                *terminal_exported_primitive_count = None;
             }
             event_and_text = Some((
                 event,
@@ -1584,10 +1589,12 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             event.densification_and_compaction_ns = duration_ns(report.validation_duration);
             if let JobCallback::V2 {
                 last_primitive_count,
+                terminal_exported_primitive_count,
                 ..
             } = callback
             {
                 *last_primitive_count = report.exported_splat_count;
+                *terminal_exported_primitive_count = Some(report.exported_splat_count);
             }
             event_and_text = Some((
                 event,
@@ -1620,14 +1627,109 @@ fn emit_v2_terminal(
     if let JobCallback::V2 {
         initial_primitive_count,
         last_primitive_count,
+        terminal_exported_primitive_count,
         ..
     } = callback
     {
         event.initial_primitive_count = *initial_primitive_count;
-        event.final_primitive_count = *last_primitive_count;
+        event.final_primitive_count =
+            terminal_exported_primitive_count.unwrap_or(*last_primitive_count);
     }
     if status == TrainExitCode::Cancelled && event.error_code == BrushErrorCodeV2::None {
         event.error_code = BrushErrorCodeV2::Cancelled;
     }
     emit_v2(callback, event, detail);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brush_process::message::InitializerReport;
+    use brush_serde::SplatExportValidationReport;
+
+    extern "C" fn collect_event(event: BrushEventV2, user_data: *mut c_void) {
+        // SAFETY: the test keeps this Vec alive for every synchronous callback.
+        unsafe { &mut *user_data.cast::<Vec<BrushEventV2>>() }.push(event);
+    }
+
+    #[test]
+    fn terminal_count_uses_export_compaction_after_delayed_step() {
+        let mut events: Vec<BrushEventV2> = Vec::new();
+        let mut callback = JobCallback::V2 {
+            callback: collect_event,
+            user_data_address: std::ptr::from_mut(&mut events) as usize,
+            started: Instant::now(),
+            initial_primitive_count: 0,
+            last_primitive_count: 0,
+            terminal_exported_primitive_count: None,
+        };
+
+        emit_progress_message_v2(
+            &ProcessMessage::TrainMessage(TrainMessage::Initializer {
+                report: InitializerReport {
+                    route: InitializerRoute::ExplicitStrong,
+                    path: None,
+                    primitive_count: 11_169,
+                    fields_consumed: 0,
+                    rejected_count: 0,
+                    supplied_sh_degree: Some(0),
+                    configured_sh_degree: 3,
+                },
+            }),
+            &mut callback,
+        );
+        emit_progress_message_v2(
+            &ProcessMessage::TrainMessage(TrainMessage::TerminalCompaction {
+                iter: 300,
+                report: SplatExportValidationReport {
+                    original_splat_count: 13_209,
+                    exported_splat_count: 13_198,
+                    pruned_non_finite_count: 11,
+                    transforms_non_finite_row_count: 11,
+                    sh_coeffs_non_finite_row_count: 0,
+                    opacity_non_finite_row_count: 11,
+                    validation_duration: std::time::Duration::ZERO,
+                },
+            }),
+            &mut callback,
+        );
+        emit_progress_message_v2(
+            &ProcessMessage::TrainMessage(TrainMessage::TrainStep {
+                iter: 300,
+                total_elapsed: std::time::Duration::ZERO,
+                step_duration: std::time::Duration::ZERO,
+                data_wait_duration: std::time::Duration::ZERO,
+                forward_duration: std::time::Duration::ZERO,
+                loss_duration: std::time::Duration::ZERO,
+                backward_duration: std::time::Duration::ZERO,
+                optimizer_duration: std::time::Duration::ZERO,
+                optimizer_transforms_duration: None,
+                optimizer_sh_coeffs_duration: None,
+                optimizer_opacity_duration: None,
+                render_before_count_readback_duration: None,
+                render_count_readback_duration: None,
+                render_after_count_readback_duration: None,
+                live_splat_count: 13_209,
+                lod_progress: None,
+            }),
+            &mut callback,
+        );
+        emit_v2_terminal(
+            &callback,
+            TrainExitCode::Success,
+            BrushErrorCodeV2::None,
+            None,
+        );
+
+        let compaction = events
+            .iter()
+            .find(|event| event.kind == BrushEventKindV2::TerminalCompaction)
+            .expect("missing terminal compaction event");
+        assert_eq!(compaction.primitive_count, 13_198);
+        assert_eq!(compaction.pruned_non_finite_count, 11);
+        let terminal = events.last().expect("missing terminal event");
+        assert_eq!(terminal.kind, BrushEventKindV2::Terminal);
+        assert_eq!(terminal.initial_primitive_count, 11_169);
+        assert_eq!(terminal.final_primitive_count, 13_198);
+    }
 }
