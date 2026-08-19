@@ -258,6 +258,10 @@ pub(crate) async fn train_stream(
     // clone to the `Slot` after every modification (train
     // step, refine, LOD decimation).
     let mut splats: Splats = init_splats.clone();
+    #[cfg(feature = "trainer-diagnostics")]
+    if train_stream_config.host_runtime.phase0_telemetry {
+        emit_trainer_finiteness_diagnostic(&splats, 0, "post_import").await;
+    }
     slot.set(0, splats.clone());
     emitter
         .emit(ProcessMessage::SplatsUpdated {
@@ -495,6 +499,10 @@ pub(crate) async fn train_stream(
         let (new_diff_splats, stats) = trainer.step(batch, diff_splats).await;
         splats = new_diff_splats.valid();
         slot.set(0, splats.clone());
+        #[cfg(feature = "trainer-diagnostics")]
+        if train_stream_config.host_runtime.phase0_telemetry {
+            emit_trainer_finiteness_diagnostic(&splats, iter + 1, "post_optimizer").await;
+        }
 
         // Phase-local iteration for refine gating
         let phase_iter = if current_lod == 0 {
@@ -517,6 +525,10 @@ pub(crate) async fn train_stream(
             let (new_splats, refine_stats) = trainer.refine(iter, splats).await;
             splats = new_splats;
             slot.set(0, splats.clone());
+            #[cfg(feature = "trainer-diagnostics")]
+            if train_stream_config.host_runtime.phase0_telemetry {
+                emit_trainer_finiteness_diagnostic(&splats, iter + 1, "post_refine").await;
+            }
             refine_stats
         } else {
             RefineStats {
@@ -1034,4 +1046,128 @@ async fn export_checkpoint(
         .await
         .context(format!("Failed to export ply {export_path:?}"))?;
     Ok((output_path, report))
+}
+
+#[cfg(feature = "trainer-diagnostics")]
+async fn emit_trainer_finiteness_diagnostic(
+    splats: &Splats,
+    iteration: u32,
+    boundary: &'static str,
+) {
+    let transforms_tensor = splats.transforms.val();
+    let sh_coeffs_tensor = splats.sh_coeffs.val();
+    let opacities_tensor = splats.raw_opacities.val();
+    let vectors: Vec<Vec<f32>> = burn::tensor::Transaction::default()
+        .register(transforms_tensor)
+        .register(sh_coeffs_tensor)
+        .register(opacities_tensor)
+        .execute_async()
+        .await
+        .expect("trainer diagnostic tensor readback failed")
+        .into_iter()
+        .map(|data| {
+            data.into_vec::<f32>()
+                .expect("trainer diagnostic tensor conversion failed")
+        })
+        .collect();
+    let [transforms, sh_coeffs, opacities]: [Vec<f32>; 3] = vectors
+        .try_into()
+        .expect("trainer diagnostic transaction result mismatch");
+    let row_count = splats.num_splats() as usize;
+    let transform_stride = 10;
+    let sh_stride = sh_coeffs.len() / row_count.max(1);
+
+    fn invalid_rows_and_columns(values: &[f32], stride: usize) -> (Vec<usize>, Vec<u32>) {
+        let mut rows = Vec::new();
+        let mut columns = vec![0; stride];
+        for (row_index, row) in values.chunks_exact(stride).enumerate() {
+            let mut row_invalid = false;
+            for (column_index, value) in row.iter().enumerate() {
+                if !value.is_finite() {
+                    columns[column_index] += 1;
+                    row_invalid = true;
+                }
+            }
+            if row_invalid {
+                rows.push(row_index);
+            }
+        }
+        (rows, columns)
+    }
+
+    let (transform_rows, transform_columns) =
+        invalid_rows_and_columns(&transforms, transform_stride);
+    let (sh_rows, _sh_columns) = invalid_rows_and_columns(&sh_coeffs, sh_stride);
+    let (opacity_rows, _opacity_columns) = invalid_rows_and_columns(&opacities, 1);
+    let mut invalid_rows = transform_rows
+        .iter()
+        .chain(&sh_rows)
+        .chain(&opacity_rows)
+        .copied()
+        .collect::<Vec<_>>();
+    invalid_rows.sort_unstable();
+    invalid_rows.dedup();
+
+    let transform_names = [
+        "mean_x",
+        "mean_y",
+        "mean_z",
+        "rotation_0",
+        "rotation_1",
+        "rotation_2",
+        "rotation_3",
+        "log_scale_0",
+        "log_scale_1",
+        "log_scale_2",
+    ];
+    let transform_column_non_finite = transform_names
+        .iter()
+        .zip(transform_columns)
+        .map(|(name, count)| serde_json::json!({"name": name, "count": count}))
+        .collect::<Vec<_>>();
+    let transform_ranges = transform_names
+        .iter()
+        .enumerate()
+        .map(|(column_index, name)| {
+            let finite = transforms
+                .chunks_exact(transform_stride)
+                .filter_map(|row| row[column_index].is_finite().then_some(row[column_index]))
+                .collect::<Vec<_>>();
+            let minimum = finite.iter().copied().reduce(f32::min);
+            let maximum = finite.iter().copied().reduce(f32::max);
+            serde_json::json!({"name": name, "minimum": minimum, "maximum": maximum})
+        })
+        .collect::<Vec<_>>();
+    let diagnostic = serde_json::json!({
+        "schemaVersion": 1,
+        "iteration": iteration,
+        "boundary": boundary,
+        "primitiveCount": row_count,
+        "nonFiniteRowCount": invalid_rows.len(),
+        "nonFiniteRows": invalid_rows,
+        "transformNonFiniteRows": transform_rows,
+        "shNonFiniteRows": sh_rows,
+        "opacityNonFiniteRows": opacity_rows,
+        "transformColumnNonFiniteCounts": transform_column_non_finite,
+        "transformFiniteRanges": transform_ranges,
+    });
+    let selected_boundary = boundary != "post_optimizer"
+        || matches!(iteration, 1 | 199 | 200 | 201 | 202 | 300)
+        || !diagnostic["nonFiniteRows"]
+            .as_array()
+            .expect("diagnostic rows must be an array")
+            .is_empty();
+    if selected_boundary {
+        let line = format!("BRUSHKIT_TRAINER_FINITE_DIAGNOSTIC {diagnostic}");
+        eprintln!("{line}");
+        if let Some(path) = std::env::var_os("BRUSHKIT_TRAINER_DIAGNOSTIC_PATH") {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("opening trainer diagnostic output failed");
+            writeln!(file, "{line}").expect("writing trainer diagnostic output failed");
+        }
+    }
 }

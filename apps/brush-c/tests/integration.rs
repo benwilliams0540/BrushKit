@@ -672,6 +672,94 @@ fn assert_numeric_outputs_equivalent(reference: &[u8], candidate: &[u8]) {
 }
 
 #[test]
+#[ignore = "manual external Variant-D trainer diagnosis"]
+fn diagnose_external_variant_d_fixture() {
+    let dataset_path = std::env::var("BRUSHKIT_VARIANT_D_DATASET")
+        .expect("BRUSHKIT_VARIANT_D_DATASET must name the read-only trainer leaf");
+    let output_path = std::env::var("BRUSHKIT_VARIANT_D_OUTPUT")
+        .expect("BRUSHKIT_VARIANT_D_OUTPUT must name a dedicated derived output directory");
+    fs::create_dir_all(&output_path).unwrap();
+
+    let dataset_path = CString::new(dataset_path).unwrap();
+    let output_path = CString::new(output_path).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("initializers/variant-d.ply").unwrap();
+    let mut options = v3_options(&output_path, &export_name, &initializer);
+    options.seed = 0;
+    options.total_train_steps = 300;
+    options.refine_every = 200;
+    options.max_resolution = 1080;
+    options.max_splats = 500_000;
+    options.export_every = 300;
+    options.instrumentation_level = 1;
+    options.progressive_resolution_start_percent = 50;
+    options.progressive_resolution_switch_iteration = 200;
+    let mut state = V2CallbackState::default();
+
+    // SAFETY: callback state and all option strings outlive wait and release.
+    let job = unsafe {
+        brush_train_start_v3(
+            dataset_path.as_ptr(),
+            &options,
+            test_v2_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert!(!job.is_null(), "Variant-D diagnostic job failed to start");
+    // SAFETY: job is a live V3 handle using the V2 lifecycle contract.
+    let status = unsafe { brush_job_wait_v2(job) };
+    // SAFETY: the completed handle has not previously been released.
+    unsafe { brush_job_release_v2(job) };
+    assert_eq!(status, TrainExitCode::Success);
+
+    let events = state.events.lock().unwrap();
+    let initializer = events
+        .iter()
+        .find(|event| event.0.kind == BrushEventKindV2::Initializer)
+        .expect("missing initializer event")
+        .0;
+    let refinement_net: i64 = events
+        .iter()
+        .filter(|event| event.0.kind == BrushEventKindV2::Refinement)
+        .map(|event| event.0.net_growth)
+        .sum();
+    let terminal_compaction = events
+        .iter()
+        .find(|event| event.0.kind == BrushEventKindV2::TerminalCompaction)
+        .expect("missing terminal compaction event")
+        .0;
+    let terminal = events
+        .last()
+        .filter(|event| event.0.kind == BrushEventKindV2::Terminal)
+        .expect("missing terminal event")
+        .0;
+    println!(
+        "BRUSHKIT_VARIANT_D_ACCOUNTING initial={} refinement_net={} terminal_pruned_non_finite={} exported={} terminal_final={}",
+        initializer.primitive_count,
+        refinement_net,
+        terminal_compaction.pruned_non_finite_count,
+        terminal_compaction.primitive_count,
+        terminal.final_primitive_count,
+    );
+    let expected_exported =
+        i64::from(initializer.primitive_count) + refinement_net + terminal_compaction.net_growth;
+    assert_eq!(
+        expected_exported,
+        i64::from(terminal_compaction.primitive_count),
+        "initial + refinement net + terminal compaction net must equal exported count"
+    );
+    assert_eq!(
+        terminal.final_primitive_count, terminal_compaction.primitive_count,
+        "terminal final count must equal the exhaustively validated export population"
+    );
+    assert!(
+        Path::new(output_path.to_str().unwrap())
+            .join("component-0_300.ply")
+            .is_file()
+    );
+}
+
+#[test]
 #[ignore = "manual Fast Preview instrumentation overhead and determinism evidence"]
 fn validate_v2_phase0_overhead_and_determinism() {
     // Warm the shared Metal/Burn setup and shader cache outside the samples.

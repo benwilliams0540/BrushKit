@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 debug-validation = ["brush-render-bwd/debug-validation"]
 image-loss-bwd-tile-16 = ["brush-loss/image-loss-bwd-tile-16"]
+trainer-diagnostics = ["dep:serde_json"]
 
 [dependencies]
 web-time.workspace = true
@@ -22,6 +23,7 @@ anyhow.workspace = true
 image.workspace = true
 clap.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 glam.workspace = true
 rand.workspace = true
 tracing.workspace = true

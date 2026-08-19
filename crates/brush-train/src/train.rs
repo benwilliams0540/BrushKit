@@ -338,6 +338,22 @@ impl SplatTrainer {
             )
         };
 
+        #[cfg(feature = "trainer-diagnostics")]
+        if self.phase0_host_telemetry {
+            let transform_gradient = splats
+                .transforms
+                .grad(&grads)
+                .expect("transform gradient missing from trainer diagnostic");
+            emit_transform_gradient_diagnostic(
+                transform_gradient,
+                splats.transforms.val(),
+                splats.min_scale.clone(),
+                visible.clone(),
+                self.step_count,
+            )
+            .await;
+        }
+
         // OptimizerAdaptor strips autodiff before calling SimpleOptimizer::step,
         // so optimizer state (scaling, momentum) lives on the inner device.
         let opt_device = device.clone().inner();
@@ -1017,4 +1033,150 @@ fn sample_background_color_with_rng<R: rand::Rng + ?Sized>(
         rng.random_range(-strength..strength),
     );
     (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
+}
+
+#[cfg(feature = "trainer-diagnostics")]
+async fn emit_transform_gradient_diagnostic(
+    gradient: Tensor<2>,
+    transforms: Tensor<2>,
+    min_scale: Option<Tensor<1>>,
+    visible: Tensor<1>,
+    iteration: u32,
+) {
+    let values = gradient
+        .into_data_async()
+        .await
+        .expect("reading trainer transform gradient failed")
+        .into_vec::<f32>()
+        .expect("converting trainer transform gradient failed");
+    let transform_values = transforms
+        .into_data_async()
+        .await
+        .expect("reading trainer transform parameters failed")
+        .into_vec::<f32>()
+        .expect("converting trainer transform parameters failed");
+    let min_scale_values = match min_scale {
+        Some(min_scale) => Some(
+            min_scale
+                .into_data_async()
+                .await
+                .expect("reading trainer minimum scale failed")
+                .into_vec::<f32>()
+                .expect("converting trainer minimum scale failed"),
+        ),
+        None => None,
+    };
+    let visible_values = visible
+        .into_data_async()
+        .await
+        .expect("reading trainer visibility failed")
+        .into_vec::<f32>()
+        .expect("converting trainer visibility failed");
+    let column_names = [
+        "mean_x",
+        "mean_y",
+        "mean_z",
+        "rotation_0",
+        "rotation_1",
+        "rotation_2",
+        "rotation_3",
+        "log_scale_0",
+        "log_scale_1",
+        "log_scale_2",
+    ];
+    let mut invalid_rows = Vec::new();
+    let mut invalid_values = Vec::new();
+    let mut column_non_finite_counts = [0u32; 10];
+    for (row_index, row) in values.chunks_exact(10).enumerate() {
+        let mut row_invalid = false;
+        for (column_index, value) in row.iter().copied().enumerate() {
+            if !value.is_finite() {
+                row_invalid = true;
+                column_non_finite_counts[column_index] += 1;
+                let kind = if value.is_nan() {
+                    "nan"
+                } else if value.is_sign_positive() {
+                    "+inf"
+                } else {
+                    "-inf"
+                };
+                invalid_values.push(serde_json::json!({
+                    "row": row_index,
+                    "column": column_names[column_index],
+                    "kind": kind,
+                }));
+            }
+        }
+        if row_invalid {
+            invalid_rows.push(row_index);
+        }
+    }
+    let column_stats = column_names
+        .iter()
+        .enumerate()
+        .map(|(column_index, name)| {
+            let finite = values
+                .chunks_exact(10)
+                .filter_map(|row| row[column_index].is_finite().then_some(row[column_index]))
+                .collect::<Vec<_>>();
+            let minimum = finite.iter().copied().reduce(f32::min);
+            let maximum = finite.iter().copied().reduce(f32::max);
+            let maximum_absolute = finite.iter().copied().map(f32::abs).reduce(f32::max);
+            serde_json::json!({
+                "name": name,
+                "nonFiniteCount": column_non_finite_counts[column_index],
+                "minimum": minimum,
+                "maximum": maximum,
+                "maximumAbsolute": maximum_absolute,
+            })
+        })
+        .collect::<Vec<_>>();
+    let invalid_row_details = invalid_rows
+        .iter()
+        .map(|row_index| {
+            let transform = &transform_values[row_index * 10..(row_index + 1) * 10];
+            let floor = min_scale_values.as_ref().map(|values| values[*row_index]);
+            let floor_squared = floor.map(|value| value * value).unwrap_or(0.0);
+            let folded_log_scales = transform[7..10]
+                .iter()
+                .map(|log_scale| (log_scale.mul_add(2.0, 0.0).exp() + floor_squared).ln() * 0.5)
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "row": row_index,
+                "visible": visible_values[*row_index] != 0.0,
+                "minScale": floor,
+                "rawTransform": transform,
+                "foldedLogScales": folded_log_scales,
+            })
+        })
+        .collect::<Vec<_>>();
+    let diagnostic = serde_json::json!({
+        "schemaVersion": 1,
+        "iteration": iteration,
+        "boundary": "pre_transform_optimizer_gradient",
+        "primitiveCount": values.len() / 10,
+        "nonFiniteRowCount": invalid_rows.len(),
+        "nonFiniteRows": invalid_rows,
+        "nonFiniteValues": invalid_values,
+        "invalidRowDetails": invalid_row_details,
+        "columnStats": column_stats,
+    });
+    let selected_iteration = matches!(iteration, 1 | 199 | 200 | 201 | 202 | 232 | 267 | 300)
+        || !diagnostic["nonFiniteRows"]
+            .as_array()
+            .expect("diagnostic rows must be an array")
+            .is_empty();
+    if selected_iteration {
+        let line = format!("BRUSHKIT_TRAINER_GRADIENT_DIAGNOSTIC {diagnostic}");
+        eprintln!("{line}");
+        if let Some(path) = std::env::var_os("BRUSHKIT_TRAINER_GRADIENT_DIAGNOSTIC_PATH") {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("opening trainer gradient diagnostic output failed");
+            writeln!(file, "{line}").expect("writing trainer gradient diagnostic output failed");
+        }
+    }
 }

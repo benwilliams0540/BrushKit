@@ -12,6 +12,7 @@ debug-validation = ["brush-train/debug-validation"]
 dialogs = ["brush-vfs/dialogs"]
 image-loss-bwd-tile-16 = ["brush-train/image-loss-bwd-tile-16"]
 rerun = ["brush-rerun/rerun"]
+trainer-diagnostics = ["brush-train/trainer-diagnostics"]
 
 [dependencies]
 brush-render.path = "../brush-render"

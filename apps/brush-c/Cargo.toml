@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 
 [features]
 image-loss-bwd-tile-16 = ["brush-process/image-loss-bwd-tile-16"]
+trainer-diagnostics = ["brush-process/trainer-diagnostics"]
 
 [dependencies]
 burn-cubecl.workspace = true
