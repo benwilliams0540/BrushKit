@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
           "provenance format missing");
   require(strstr(provenance, argv[1]) != NULL,
           "provenance engine revision mismatch");
-  require(strstr(provenance, "callable_abi=2;additive_train_abi=3;") != NULL,
+  require(strstr(provenance, "callable_abi=2;additive_train_abi=4;") != NULL,
           "provenance ABI record missing");
   require(strstr(provenance, argv[3]) != NULL,
           "provenance Apple feature mismatch");

@@ -140,11 +140,12 @@ jobs:
           grep -Fxq "engine_source_sha=$BRUSHKIT_BUILD_REVISION" "$provenance"
           grep -Fxq "crate_version=${RELEASE_TAG#brushkit-ffi-v}" "$provenance"
           grep -Fxq 'callable_abi=2' "$provenance"
-          grep -Fxq 'additive_train_abi=3' "$provenance"
+          grep -Fxq 'additive_train_abi=4' "$provenance"
           grep -Fxq "apple_features=$RELEASE_CARGO_FEATURES" "$provenance"
           grep -Fxq 'cubecl_gpu_profile=off' "$provenance"
           grep -Fq 'rustc=rustc 1.95.0 ' "$provenance"
           grep -Fxq 'targets=aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim' "$provenance"
+          cmp LICENSE artifacts/BrushKitFFI.xcframework/LICENSE
 
           for library in artifacts/BrushKitFFI.xcframework/*/libbrush_c.a; do
             xcrun lipo "$library" -verify_arch arm64
@@ -205,7 +206,7 @@ jobs:
           - iOS arm64
           - iOS Simulator arm64
 
-          Callable ABI version: 2. Additive V3 training entry point included. Legacy v0.2.1 entry points remain available.
+          Callable ABI version: 2. Additive V3 and V4 training entry points included. V4 progressive SH is default-disabled. Legacy v0.2.1 entry points remain available.
 
           Apple artifact feature set: \`$RELEASE_CARGO_FEATURES\`. CubeCL GPU profiler: off. Immutable build provenance is embedded in each native slice and recorded in \`BrushKitFFI.provenance.txt\`.
 

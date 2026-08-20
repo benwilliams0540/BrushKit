@@ -70,12 +70,14 @@ xcodebuild -create-xcframework \
   "${xcframework_args[@]}" \
   -output "$output_dir"
 
+cp "$repo_root/LICENSE" "$output_dir/LICENSE"
+
 printf '%s\n' \
   'format=brushkit-xcframework-provenance-v1' \
   "engine_source_sha=$build_revision" \
   "crate_version=$workspace_version" \
   'callable_abi=2' \
-  'additive_train_abi=3' \
+  'additive_train_abi=4' \
   "apple_features=${cargo_features:-none}" \
   "cubecl_gpu_profile=$cubecl_gpu_profile" \
   "rustc=$rustc_version" \
