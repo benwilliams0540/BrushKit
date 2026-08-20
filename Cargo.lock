@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "brush-app"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "brush-async"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "futures",
  "js-sys",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "brush-bench-test"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "brush-async",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "brush-c"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-process",
  "brush-render",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "brush-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "brush-async",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "brush-cube"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "burn",
  "burn-cubecl",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "brush-dataset"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-async",
  "brush-render",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "brush-js"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-process",
  "brush-render",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "brush-loss"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-cube",
  "brush-render",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "brush-prefix-sum"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-cube",
  "burn",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "brush-process"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "alphanumeric-sort",
  "anyhow",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "brush-render"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "assert_approx_eq",
  "brush-cube",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "brush-render-bwd"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-cube",
  "brush-render",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "brush-rerun"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "brush-dataset",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "brush-serde"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-fn-stream",
  "brush-async",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "brush-serde-macros"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "brush-sort"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-cube",
  "burn",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "brush-train"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "ball-tree",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "brush-vfs"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async_zip",
  "brush-async",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "colmap-reader"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-async",
  "glam",
@@ -5386,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "lpips"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "brush-cube",
  "burn",
@@ -5399,7 +5399,7 @@ dependencies = [
 
 [[package]]
 name = "lpips-convert"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "burn",
  "burn-store",
@@ -8223,7 +8223,7 @@ dependencies = [
 
 [[package]]
 name = "rrfd"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "futures-channel",
