@@ -13,7 +13,10 @@ use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::{render_splats, render_splats_with_host_timing};
+use brush_render_bwd::{
+    render_splats, render_splats_with_active_sh_degree,
+    render_splats_with_active_sh_degree_and_host_timing, render_splats_with_host_timing,
+};
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -61,6 +64,9 @@ pub struct SplatTrainer {
     bounds: BoundingBox,
     step_count: u32,
     max_sh_degree: u32,
+    active_sh_degree: Option<u32>,
+    optimizer_active_sh_degree: Option<u32>,
+    progressive_sh_enabled: bool,
     /// Per-train-view (world center, focal in px at native res) for the
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
@@ -82,6 +88,26 @@ fn inv_sigmoid(x: Tensor<1>) -> Tensor<1> {
 
 fn create_optimizer_from_config() -> OptimizerType {
     AdamScaledConfig::new().with_epsilon(1e-15).init()
+}
+
+fn sh_optimizer_scales(
+    maximum_degree: u32,
+    active_degree: u32,
+    higher_band_lr_divisor: f32,
+) -> Vec<f32> {
+    assert!(
+        active_degree <= maximum_degree,
+        "active SH degree cannot exceed the fixed storage degree"
+    );
+    let total = sh_coeffs_for_degree(maximum_degree) as usize;
+    let active = sh_coeffs_for_degree(active_degree) as usize;
+    let mut scales = vec![0.0f32; total];
+    scales[0] = 1.0;
+    let rest_scale = 1.0 / higher_band_lr_divisor;
+    for scale in &mut scales[1..active] {
+        *scale = rest_scale;
+    }
+    scales
 }
 
 /// Per-splat world-space scale floor for the Mip-Splatting 3D filter:
@@ -151,6 +177,9 @@ impl SplatTrainer {
             bounds,
             step_count: 0,
             max_sh_degree: 0,
+            active_sh_degree: None,
+            optimizer_active_sh_degree: None,
+            progressive_sh_enabled: false,
             view_cams: Vec::new(),
             deterministic_rng: None,
             phase0_host_telemetry: false,
@@ -173,13 +202,35 @@ impl SplatTrainer {
         self.phase0_host_telemetry = enabled;
     }
 
+    pub fn set_active_sh_degree(&mut self, active_degree: u32, progressive_enabled: bool) {
+        assert!(active_degree <= 4, "active SH degree must be at most 4");
+        self.active_sh_degree = Some(active_degree);
+        self.progressive_sh_enabled = progressive_enabled;
+    }
+
+    pub fn active_sh_degree(&self) -> Option<u32> {
+        self.active_sh_degree
+    }
+
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
-        // Track max SH degree from the first splats we see.
+        // Track the fixed storage degree from the first splats we see.
         if self.step_count == 0 {
             self.max_sh_degree = splats.sh_degree();
+        } else {
+            assert_eq!(
+                splats.sh_degree(),
+                self.max_sh_degree,
+                "SH storage degree changed during training"
+            );
         }
+        let active_sh_degree = self.active_sh_degree.unwrap_or(self.max_sh_degree);
+        assert!(
+            active_sh_degree <= self.max_sh_degree,
+            "active SH degree {active_sh_degree} exceeds storage degree {}",
+            self.max_sh_degree
+        );
         self.step_count += 1;
 
         let [img_h, img_w] = batch.img_size();
@@ -224,14 +275,36 @@ impl SplatTrainer {
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
             let forward_start = Instant::now();
-            let diff_out = if self.phase0_host_telemetry {
-                render_splats_with_host_timing(render_input, &camera, img_size, background)
-                    .instrument(trace_span!("Forward"))
-                    .await
+            let diff_out = if active_sh_degree == self.max_sh_degree {
+                if self.phase0_host_telemetry {
+                    render_splats_with_host_timing(render_input, &camera, img_size, background)
+                        .instrument(trace_span!("Forward"))
+                        .await
+                } else {
+                    render_splats(render_input, &camera, img_size, background)
+                        .instrument(trace_span!("Forward"))
+                        .await
+                }
+            } else if self.phase0_host_telemetry {
+                render_splats_with_active_sh_degree_and_host_timing(
+                    render_input,
+                    &camera,
+                    img_size,
+                    background,
+                    active_sh_degree,
+                )
+                .instrument(trace_span!("Forward"))
+                .await
             } else {
-                render_splats(render_input, &camera, img_size, background)
-                    .instrument(trace_span!("Forward"))
-                    .await
+                render_splats_with_active_sh_degree(
+                    render_input,
+                    &camera,
+                    img_size,
+                    background,
+                    active_sh_degree,
+                )
+                .instrument(trace_span!("Forward"))
+                .await
             };
             let forward_duration = forward_start.elapsed();
             let render_host_timings = diff_out.host_timings;
@@ -357,29 +430,60 @@ impl SplatTrainer {
         // OptimizerAdaptor strips autodiff before calling SimpleOptimizer::step,
         // so optimizer state (scaling, momentum) lives on the inner device.
         let opt_device = device.clone().inner();
-        let optimizer =
-            self.optim.get_or_insert_with(|| {
-                let sh_degree = splats.sh_degree();
-                let num_coeffs = sh_coeffs_for_degree(sh_degree) as usize;
+        let optimizer_was_none = self.optim.is_none();
+        let progressive_sh_enabled = self.progressive_sh_enabled;
+        let optimizer = self.optim.get_or_insert_with(|| {
+            let sh_degree = splats.sh_degree();
+            let num_coeffs = sh_coeffs_for_degree(sh_degree) as usize;
 
-                // DC (band 0) uses full LR; bands 1+ are scaled down.
-                let mut scales = vec![1.0f32; num_coeffs];
-                let rest_scale = 1.0 / self.config.lr_coeffs_sh_scale;
-                for s in &mut scales[1..] {
-                    *s = rest_scale;
-                }
-                let sh_lr_scales = Tensor::<1>::from_floats(scales.as_slice(), &opt_device)
-                    .reshape([1, num_coeffs as i32, 1]);
+            // DC (band 0) uses full LR; bands 1+ are scaled down.
+            let scales =
+                sh_optimizer_scales(sh_degree, active_sh_degree, self.config.lr_coeffs_sh_scale);
+            let sh_lr_scales = Tensor::<1>::from_floats(scales.as_slice(), &opt_device).reshape([
+                1,
+                num_coeffs as i32,
+                1,
+            ]);
 
-                create_optimizer_from_config().load_record(HashMap::from([(
-                    splats.sh_coeffs.id,
-                    AdaptorRecord::from_state(AdamState {
-                        momentum: None,
-                        scaling: Some(sh_lr_scales),
-                        reduce_moment_2: true,
-                    }),
-                )]))
-            });
+            create_optimizer_from_config().load_record(HashMap::from([(
+                splats.sh_coeffs.id,
+                AdaptorRecord::from_state(AdamState {
+                    momentum: None,
+                    scaling: Some(sh_lr_scales),
+                    // Progressive mode needs per-coefficient second moments
+                    // so inactive bands remain exactly zero until activation.
+                    reduce_moment_2: !progressive_sh_enabled,
+                }),
+            )]))
+        });
+        if optimizer_was_none {
+            self.optimizer_active_sh_degree = Some(active_sh_degree);
+        } else if self.optimizer_active_sh_degree != Some(active_sh_degree) {
+            // Activation changes only the per-coefficient LR mask. Full-SH3
+            // parameters retain their initializer/refinement values, inactive
+            // first/second moments remain zero, and Adam's shared step counter
+            // continues rather than being reset at a transition.
+            let mut record = optimizer.to_record();
+            let existing = record
+                .remove(&splats.sh_coeffs.id)
+                .expect("missing SH optimizer record during degree transition");
+            let mut state: AdamState<3> = existing.into_state();
+            let scales = sh_optimizer_scales(
+                self.max_sh_degree,
+                active_sh_degree,
+                self.config.lr_coeffs_sh_scale,
+            );
+            state.scaling = Some(
+                Tensor::<1>::from_floats(scales.as_slice(), &opt_device).reshape([
+                    1,
+                    sh_coeffs_for_degree(self.max_sh_degree) as i32,
+                    1,
+                ]),
+            );
+            record.insert(splats.sh_coeffs.id, AdaptorRecord::from_state(state));
+            *optimizer = create_optimizer_from_config().load_record(record);
+            self.optimizer_active_sh_degree = Some(active_sh_degree);
+        }
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
 
@@ -512,6 +616,11 @@ impl SplatTrainer {
     }
 
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
+        assert_eq!(
+            splats.sh_degree(),
+            self.max_sh_degree,
+            "SH storage degree changed before refinement"
+        );
         let progress = iter as f32 / self.config.total_train_iters.max(1) as f32;
         // Refine manipulates the canonical (un-floored) params, so bake the
         // current 3D-filter floor into them first — split/clone/prune then see
@@ -724,6 +833,11 @@ impl SplatTrainer {
         // split shrink so oversized splats' children land at `split_at_screen_size`.
         let screen_sizes = refiner.max_screen_size.clone();
         splats = self.refine_splats(&device, record, splats, split_inds, screen_sizes, iter);
+        assert_eq!(
+            splats.sh_degree(),
+            self.max_sh_degree,
+            "SH storage degree changed during refinement"
+        );
 
         // Update current bounds based on the splats.
         self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;

@@ -129,7 +129,7 @@ impl SplatBwdOps for MainBackendBase {
         let v_coeffs = Self::float_zeros(
             [
                 num_points,
-                sh_coeffs_for_degree(project_uniforms.sh_degree) as usize,
+                sh_coeffs_for_degree(project_uniforms.storage_sh_degree) as usize,
                 3,
             ]
             .into(),
@@ -161,6 +161,7 @@ impl SplatBwdOps for MainBackendBase {
                 v_refine_weight.clone().into_tensor_arg(),
                 uniforms,
                 mip_splat,
+                project_uniforms.storage_sh_degree,
                 project_uniforms.sh_degree,
                 project_uniforms.camera_model,
             );

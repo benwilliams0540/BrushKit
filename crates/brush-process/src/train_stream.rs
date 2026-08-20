@@ -6,6 +6,7 @@ use crate::{
         INITIALIZER_FIELD_ROTATIONS, INITIALIZER_FIELD_SH, InitializerReport, InitializerRoute,
         ProcessMessage, TelemetryBoundary, TrainMessage,
     },
+    progressive_sh::{PROGRESSIVE_SH_MODE_INTERVAL, ShTransitionReason},
     slot::SlotSender,
     wait_for_device,
 };
@@ -58,6 +59,24 @@ pub(crate) async fn train_stream(
         .await;
 
     let process_config = &train_stream_config.process_config;
+    let progressive_sh_schedule = train_stream_config
+        .host_runtime
+        .progressive_sh_schedule
+        .clone();
+    if let Some(schedule) = &progressive_sh_schedule {
+        anyhow::ensure!(
+            schedule.maximum_degree() == train_stream_config.model_config.sh_degree,
+            "progressive SH maximum degree does not match configured model degree"
+        );
+        anyhow::ensure!(
+            schedule.total_iterations() == train_stream_config.train_config.total_train_iters,
+            "progressive SH total iterations do not match training configuration"
+        );
+        anyhow::ensure!(
+            process_config.start_iter == 0,
+            "progressive SH optimizer-state resume is unsupported; refusing to reset optimizer state"
+        );
+    }
     log::info!("Using seed {}", process_config.seed);
 
     let wgpu_device = wait_for_device().await;
@@ -147,6 +166,18 @@ pub(crate) async fn train_stream(
 
     // Convert SplatData to Splats using KNN initialization
     let (up_axis, init_splats) = if let Some(msg) = load_result.init_splat {
+        if let Some(schedule) = &progressive_sh_schedule
+            && process_config.start_iter > 0
+        {
+            let checkpoint = msg.meta.progressive_sh_checkpoint.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "progressive SH resume requires compatible checkpoint schedule identity"
+                )
+            })?;
+            schedule
+                .validate_checkpoint(checkpoint, process_config.start_iter)
+                .map_err(anyhow::Error::msg)?;
+        }
         // Use loaded splats with KNN init
         let render_mode = train_stream_config
             .train_config
@@ -352,6 +383,33 @@ pub(crate) async fn train_stream(
     trainer.set_view_cams(view_cams.clone());
     trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
     trainer.set_phase0_host_telemetry(train_stream_config.host_runtime.phase0_telemetry);
+    if let Some(schedule) = &progressive_sh_schedule {
+        let active_degree = schedule.active_degree_at(process_config.start_iter);
+        trainer.set_active_sh_degree(
+            active_degree,
+            schedule.mode() == PROGRESSIVE_SH_MODE_INTERVAL,
+        );
+        emitter
+            .emit(ProcessMessage::TrainMessage(
+                TrainMessage::ShDegreeChanged {
+                    zero_based_iteration: process_config.start_iter,
+                    maximum_degree: schedule.maximum_degree(),
+                    active_degree,
+                    initial_degree: schedule.initial_degree(),
+                    step_interval: schedule.step_interval(),
+                    schedule_mode: schedule.mode(),
+                    schedule_identity: schedule.identity(),
+                    reason: if process_config.start_iter > 0 {
+                        ShTransitionReason::Resume
+                    } else if schedule.mode() == PROGRESSIVE_SH_MODE_INTERVAL {
+                        ShTransitionReason::Initial
+                    } else {
+                        ShTransitionReason::Disabled
+                    },
+                },
+            ))
+            .await;
+    }
     if train_stream_config.host_runtime.phase0_telemetry {
         emitter
             .emit(ProcessMessage::TrainMessage(
@@ -394,6 +452,29 @@ pub(crate) async fn train_stream(
 
     log::info!("Start training loop.");
     for iter in process_config.start_iter..train_stream_config.train_config.total_iters() {
+        if iter != process_config.start_iter
+            && let Some(schedule) = &progressive_sh_schedule
+            && let Some(active_degree) = schedule.transition_degree_at(iter)
+        {
+            trainer.set_active_sh_degree(
+                active_degree,
+                schedule.mode() == PROGRESSIVE_SH_MODE_INTERVAL,
+            );
+            emitter
+                .emit(ProcessMessage::TrainMessage(
+                    TrainMessage::ShDegreeChanged {
+                        zero_based_iteration: iter,
+                        maximum_degree: schedule.maximum_degree(),
+                        active_degree,
+                        initial_degree: schedule.initial_degree(),
+                        step_interval: schedule.step_interval(),
+                        schedule_mode: schedule.mode(),
+                        schedule_identity: schedule.identity(),
+                        reason: ShTransitionReason::Scheduled,
+                    },
+                ))
+                .await;
+        }
         if progressive_resolution_enabled && iter == progressive_switch_iteration {
             dataloader = make_dataloader(&dataset.train, full_resolution_cache.as_ref());
             log::info!("Progressive resolution: switched to 100% at iteration {iter}");
@@ -422,10 +503,19 @@ pub(crate) async fn train_stream(
                         ))
                         .await;
                 }
-                let res =
-                    export_checkpoint(splats.clone(), &export_path, &name, exp_iter, exp_total)
-                        .await
-                        .with_context(|| "Export at LOD boundary failed");
+                let checkpoint_metadata = progressive_sh_schedule
+                    .as_ref()
+                    .map(|schedule| schedule.checkpoint_metadata(exp_iter));
+                let res = export_checkpoint(
+                    splats.clone(),
+                    &export_path,
+                    &name,
+                    exp_iter,
+                    exp_total,
+                    checkpoint_metadata,
+                )
+                .await
+                .with_context(|| "Export at LOD boundary failed");
 
                 match res {
                     Ok((path, _report)) => {
@@ -477,6 +567,12 @@ pub(crate) async fn train_stream(
             trainer.set_view_cams(view_cams.clone());
             trainer.set_deterministic_seed(train_stream_config.host_runtime.deterministic_seed);
             trainer.set_phase0_host_telemetry(train_stream_config.host_runtime.phase0_telemetry);
+            if let Some(schedule) = &progressive_sh_schedule {
+                trainer.set_active_sh_degree(
+                    schedule.active_degree_at(iter),
+                    schedule.mode() == PROGRESSIVE_SH_MODE_INTERVAL,
+                );
+            }
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -602,10 +698,25 @@ pub(crate) async fn train_stream(
                         ))
                         .await;
                 }
-                let res =
-                    export_checkpoint(splats.clone(), &export_path, &name, exp_iter, exp_total)
-                        .await
-                        .with_context(|| format!("Export at iteration {iter} failed"));
+                if is_last_step && let Some(schedule) = &progressive_sh_schedule {
+                    anyhow::ensure!(
+                        trainer.active_sh_degree() == Some(schedule.maximum_degree()),
+                        "terminal active SH degree does not match configured/export degree"
+                    );
+                }
+                let checkpoint_metadata = progressive_sh_schedule
+                    .as_ref()
+                    .map(|schedule| schedule.checkpoint_metadata(exp_iter));
+                let res = export_checkpoint(
+                    splats.clone(),
+                    &export_path,
+                    &name,
+                    exp_iter,
+                    exp_total,
+                    checkpoint_metadata,
+                )
+                .await
+                .with_context(|| format!("Export at iteration {iter} failed"));
 
                 match res {
                     Ok((path, report)) => {
@@ -1032,15 +1143,17 @@ async fn export_checkpoint(
     export_name: &str,
     iter: u32,
     total_steps: u32,
+    progressive_sh_metadata: Option<brush_serde::ProgressiveShCheckpointMetadata>,
 ) -> Result<(PathBuf, brush_serde::SplatExportValidationReport), anyhow::Error> {
     tokio::fs::create_dir_all(&export_path)
         .await
         .with_context(|| format!("Creating export directory {}", export_path.display()))?;
     let digits = ((total_steps as f64).log10().floor() as usize) + 1;
     let export_name = export_name.replace("{iter}", &format!("{iter:0digits$}"));
-    let (splat_data, report) = brush_serde::splat_to_ply_with_report(splats)
-        .await
-        .context("Serializing splat data")?;
+    let (splat_data, report) =
+        brush_serde::splat_to_ply_with_report_and_metadata(splats, progressive_sh_metadata)
+            .await
+            .context("Serializing splat data")?;
     let output_path = export_path.join(&export_name);
     tokio::fs::write(&output_path, splat_data)
         .await

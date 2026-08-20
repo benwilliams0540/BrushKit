@@ -24,6 +24,9 @@ pub mod helpers {
         pub tile_bounds: [u32; 2],
         pub camera_position: [f32; 4],
         pub sh_degree: u32,
+        /// Physical coefficient stride. May exceed `sh_degree` while higher
+        /// bands are inactive during progressive training.
+        pub storage_sh_degree: u32,
         pub total_splats: u32,
         pub num_visible: u32,
 

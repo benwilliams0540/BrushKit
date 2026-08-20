@@ -228,6 +228,13 @@ pub async fn splat_to_ply(splats: Splats) -> Result<Vec<u8>, ExportError> {
 pub async fn splat_to_ply_with_report(
     splats: Splats,
 ) -> Result<(Vec<u8>, SplatExportValidationReport), ExportError> {
+    splat_to_ply_with_report_and_metadata(splats, None).await
+}
+
+pub async fn splat_to_ply_with_report_and_metadata(
+    splats: Splats,
+    progressive_sh_checkpoint: Option<crate::ProgressiveShCheckpointMetadata>,
+) -> Result<(Vec<u8>, SplatExportValidationReport), ExportError> {
     // Fold any 3D-filter floor into the stored scales/opacity so the ply holds
     // ordinary derived values — the floor is never written as a separate field.
     let splats = splats.bake_min_scale();
@@ -236,12 +243,15 @@ pub async fn splat_to_ply_with_report(
 
     let render_mode_str = if splats.render_mip { "mip" } else { "default" };
 
-    let comments = vec![
+    let mut comments = vec![
         "Exported from Brush".to_owned(),
         "Vertical axis: y".to_owned(),
         format!("SH degree: {}", sh_degree),
         format!("SplatRenderMode: {}", render_mode_str),
     ];
+    if let Some(metadata) = progressive_sh_checkpoint {
+        comments.push(metadata.to_comment());
+    }
     Ok((
         serde_ply::to_bytes(&ply, SerializeOptions::binary_le().with_comments(comments))?,
         report,
@@ -394,6 +404,36 @@ mod tests {
             assert_eq!(imported.sh_degree(), degree);
             assert_coeffs_match(&original, &imported).await;
         }
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn progressive_sh_checkpoint_roundtrips_identity_with_full_sh3_schema() {
+        let splats = create_test_splats(3);
+        let metadata = crate::ProgressiveShCheckpointMetadata {
+            version: 1,
+            schedule_identity: 0x0123_4567_89ab_cdef,
+            schedule_mode: 1,
+            maximum_degree: 3,
+            initial_degree: 0,
+            step_interval: 150,
+            total_iterations: 600,
+            completed_iterations: 300,
+            active_degree: 1,
+        };
+        let (ply_bytes, report) = splat_to_ply_with_report_and_metadata(splats, Some(metadata))
+            .await
+            .expect("SH3 checkpoint export");
+        assert_eq!(report.exported_splat_count, 1);
+        let ply_header = String::from_utf8_lossy(&ply_bytes);
+        assert_eq!(ply_header.matches("property float f_rest_").count(), 45);
+        assert!(ply_header.contains(&metadata.to_comment()));
+
+        let imported = load_splat_from_ply(Cursor::new(ply_bytes), None)
+            .await
+            .expect("SH3 checkpoint import");
+        assert_eq!(imported.meta.progressive_sh_checkpoint, Some(metadata));
+        let sh = imported.data.sh_coeffs.expect("SH3 coefficients");
+        assert_eq!(sh.len(), 16 * 3);
     }
 
     fn splats_with_non_finite_rows(device: &burn::tensor::Device) -> Splats {

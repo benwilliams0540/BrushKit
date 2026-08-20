@@ -8,14 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use brush_c::{
-    BRUSH_ABI_VERSION_V2, BRUSH_ABI_VERSION_V3, BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2,
-    BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2, BrushEventKindV2, BrushEventV2,
-    BrushInitializerRouteV2, BrushNativeIdentityV2, ProgressMessage, ProgressMessageKind,
-    TrainExitCode, TrainOptions, TrainOptionsV2, TrainOptionsV3, brush_get_abi_version,
+    BRUSH_ABI_VERSION_V2, BRUSH_ABI_VERSION_V3, BRUSH_ABI_VERSION_V4,
+    BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2, BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2,
+    BrushEventKindV2, BrushEventKindV4, BrushEventV2, BrushEventV4, BrushInitializerRouteV2,
+    BrushNativeIdentityV2, ProgressMessage, ProgressMessageKind, TrainExitCode, TrainOptions,
+    TrainOptionsV2, TrainOptionsV3, TrainOptionsV4, brush_get_abi_version,
     brush_get_build_provenance_v1, brush_get_native_identity_v2, brush_job_cancel,
     brush_job_release, brush_job_release_v2, brush_job_retain_v2, brush_job_wait,
     brush_job_wait_v2, brush_train_start, brush_train_start_v2, brush_train_start_v3,
-    train_and_save,
+    train_and_save, train_and_save_v4,
 };
 
 #[repr(C)]
@@ -134,6 +135,26 @@ extern "C" fn test_v2_callback(event: BrushEventV2, user_data: *mut c_void) {
     state.events.lock().unwrap().push((event, text));
 }
 
+#[derive(Default)]
+struct V4CallbackState {
+    events: Mutex<Vec<(BrushEventV4, Option<String>)>>,
+}
+
+extern "C" fn test_v4_callback(event: BrushEventV4, user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: tests keep the callback state alive through wait/release.
+    let state = unsafe { &*user_data.cast::<V4CallbackState>() };
+    let text = (!event.base.text.is_null()).then(|| {
+        // SAFETY: V4 text is callback-scoped and copied before returning.
+        unsafe { CStr::from_ptr(event.base.text) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    state.events.lock().unwrap().push((event, text));
+}
+
 fn v2_options(
     output_path: &CString,
     export_name: &CString,
@@ -188,6 +209,37 @@ fn v3_options(
     }
 }
 
+fn v4_options(
+    output_path: &CString,
+    export_name: &CString,
+    initializer_path: &CString,
+) -> TrainOptionsV4 {
+    let v2 = v2_options(output_path, export_name, initializer_path, 0);
+    TrainOptionsV4 {
+        struct_size: std::mem::size_of::<TrainOptionsV4>() as u32,
+        abi_version: BRUSH_ABI_VERSION_V4,
+        seed: v2.seed,
+        render_mode: v2.render_mode,
+        sh_degree: v2.sh_degree,
+        sh_policy: v2.sh_policy,
+        total_train_steps: v2.total_train_steps,
+        refine_every: v2.refine_every,
+        max_resolution: v2.max_resolution,
+        max_splats: v2.max_splats,
+        export_every: v2.export_every,
+        output_path: v2.output_path,
+        export_name: v2.export_name,
+        initializer_path: v2.initializer_path,
+        initializer_required: v2.initializer_required,
+        instrumentation_level: v2.instrumentation_level,
+        progressive_resolution_start_percent: 100,
+        progressive_resolution_switch_iteration: 0,
+        sh_schedule_mode: 0,
+        initial_sh_degree: 3,
+        sh_degree_step_interval: 0,
+    }
+}
+
 #[test]
 fn test_v2_abi_identity_is_explicit() {
     assert_eq!(brush_get_abi_version(), 2);
@@ -219,7 +271,7 @@ fn test_v2_abi_identity_is_explicit() {
     // SAFETY: provenance is a process-lifetime, null-terminated static string.
     let provenance = unsafe { CStr::from_ptr(provenance) }.to_str().unwrap();
     assert!(provenance.starts_with("format=brushkit-build-provenance-v1;"));
-    assert!(provenance.contains(";callable_abi=2;additive_train_abi=3;"));
+    assert!(provenance.contains(";callable_abi=2;additive_train_abi=4;"));
     assert!(provenance.contains(concat!(";crate_version=", env!("CARGO_PKG_VERSION"), ";")));
     assert!(provenance.contains(";cubecl_gpu_profile=off;"));
     assert!(provenance.contains(";rustc=rustc "));
@@ -297,6 +349,178 @@ fn test_v3_progressive_resolution_job_preserves_v2_event_and_job_contracts() {
     );
     assert_eq!(events.last().unwrap().0.kind, BrushEventKindV2::Terminal);
     assert!(temp_dir.path().join("component-0_10.ply").is_file());
+}
+
+#[test]
+fn test_v4_disabled_uses_the_existing_fixed_sh3_path() {
+    let dataset_path = test_dataset_path();
+    let v3_dir = tempfile::Builder::new()
+        .prefix("ffi_v3_fixed_sh3_")
+        .tempdir()
+        .unwrap();
+    let v4_dir = tempfile::Builder::new()
+        .prefix("ffi_v4_disabled_sh3_")
+        .tempdir()
+        .unwrap();
+    let v3_path = CString::new(v3_dir.path().to_str().unwrap()).unwrap();
+    let v4_path = CString::new(v4_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+
+    let mut v3 = v3_options(&v3_path, &export_name, &initializer);
+    v3.total_train_steps = 1;
+    v3.export_every = 1;
+    v3.instrumentation_level = 0;
+    v3.progressive_resolution_start_percent = 100;
+    v3.progressive_resolution_switch_iteration = 0;
+    let mut v3_state = V2CallbackState::default();
+    // SAFETY: callback state and strings outlive wait and release.
+    let v3_job = unsafe {
+        brush_train_start_v3(
+            dataset_path.as_ptr(),
+            &v3,
+            test_v2_callback,
+            std::ptr::from_mut(&mut v3_state).cast(),
+        )
+    };
+    assert!(!v3_job.is_null());
+    // SAFETY: V3 uses the retained V2 ownership contract.
+    assert_eq!(unsafe { brush_job_wait_v2(v3_job) }, TrainExitCode::Success);
+    // SAFETY: matching release for start.
+    unsafe { brush_job_release_v2(v3_job) };
+
+    let mut v4 = v4_options(&v4_path, &export_name, &initializer);
+    v4.total_train_steps = 1;
+    v4.export_every = 1;
+    let mut v4_state = V4CallbackState::default();
+    // SAFETY: callback state and strings outlive the blocking call.
+    let status = unsafe {
+        train_and_save_v4(
+            dataset_path.as_ptr(),
+            &v4,
+            test_v4_callback,
+            std::ptr::from_mut(&mut v4_state).cast(),
+        )
+    };
+    assert_eq!(status, TrainExitCode::Success);
+
+    let v3_bytes = fs::read(v3_dir.path().join("component-0_1.ply")).unwrap();
+    let v4_bytes = fs::read(v4_dir.path().join("component-0_1.ply")).unwrap();
+    assert_eq!(
+        v4_bytes, v3_bytes,
+        "disabled V4 must preserve the exact fixed-SH3 output path"
+    );
+    let events = v4_state.events.lock().unwrap();
+    assert_eq!(
+        events.first().unwrap().0.kind,
+        BrushEventKindV4::Capabilities
+    );
+    assert_eq!(
+        events.get(1).unwrap().0.kind,
+        BrushEventKindV4::Configuration
+    );
+    assert_eq!(events.last().unwrap().0.kind, BrushEventKindV4::Terminal);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.0.kind == BrushEventKindV4::ActiveSHDegreeChanged)
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| { event.0.maximum_sh_degree == 3 && event.0.active_sh_degree == 3 })
+    );
+}
+
+#[test]
+fn test_v4_predeclared_schedule_emits_exact_transitions_and_sh3_checkpoints() {
+    let dataset_path = test_dataset_path();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("ffi_v4_progressive_sh_")
+        .tempdir()
+        .unwrap();
+    let output_path = CString::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let export_name = export_name_template();
+    let initializer = CString::new("strong-init.ply").unwrap();
+    let mut options = v4_options(&output_path, &export_name, &initializer);
+    options.total_train_steps = 600;
+    options.refine_every = 200;
+    options.export_every = 150;
+    options.sh_schedule_mode = 1;
+    options.initial_sh_degree = 0;
+    options.sh_degree_step_interval = 150;
+    let mut state = V4CallbackState::default();
+
+    // SAFETY: callback state and all strings outlive the blocking call.
+    let status = unsafe {
+        train_and_save_v4(
+            dataset_path.as_ptr(),
+            &options,
+            test_v4_callback,
+            std::ptr::from_mut(&mut state).cast(),
+        )
+    };
+    assert_eq!(status, TrainExitCode::Success);
+
+    let events = state.events.lock().unwrap();
+    let transitions: Vec<_> = events
+        .iter()
+        .filter(|event| event.0.kind == BrushEventKindV4::ActiveSHDegreeChanged)
+        .map(|event| {
+            (
+                event.0.zero_based_iteration,
+                event.0.active_sh_degree,
+                event.0.schedule_identity,
+            )
+        })
+        .collect();
+    assert_eq!(transitions.len(), 4);
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|(iteration, degree, _)| (*iteration, *degree))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (150, 1), (300, 2), (450, 3)]
+    );
+    let schedule_identity = transitions[0].2;
+    assert_ne!(schedule_identity, 0);
+    assert!(
+        transitions
+            .iter()
+            .all(|transition| transition.2 == schedule_identity)
+    );
+    for (iteration, degree, _) in &transitions {
+        let transition_index = events
+            .iter()
+            .position(|event| {
+                event.0.kind == BrushEventKindV4::ActiveSHDegreeChanged
+                    && event.0.zero_based_iteration == *iteration
+            })
+            .unwrap();
+        let step_index = events
+            .iter()
+            .position(|event| {
+                event.0.kind == BrushEventKindV4::Step && event.0.base.iteration > *iteration
+            })
+            .unwrap();
+        assert!(transition_index < step_index);
+        assert_eq!(events[step_index].0.active_sh_degree, *degree);
+    }
+    let terminal = events.last().unwrap().0;
+    assert_eq!(terminal.kind, BrushEventKindV4::Terminal);
+    assert_eq!(terminal.maximum_sh_degree, 3);
+    assert_eq!(terminal.active_sh_degree, 3);
+    assert_eq!(terminal.schedule_identity, schedule_identity);
+    drop(events);
+
+    for (completed, active) in [(150, 0), (300, 1), (450, 2), (600, 3)] {
+        let bytes = fs::read(temp_dir.path().join(format!("component-0_{completed}.ply"))).unwrap();
+        let ply = String::from_utf8_lossy(&bytes);
+        assert_eq!(ply.matches("property float f_rest_").count(), 45);
+        assert!(ply.contains("BrushKitProgressiveSH: version=1;"));
+        assert!(ply.contains(&format!(";completed={completed};active={active}")));
+        assert!(ply.contains(&format!(";identity={schedule_identity:016x};")));
+    }
 }
 
 #[test]

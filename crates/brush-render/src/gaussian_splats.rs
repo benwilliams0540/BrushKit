@@ -379,6 +379,7 @@ pub async fn render_splats(
 ) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
 
+    let storage_sh_degree = splats.sh_degree();
     let sh_coeffs = splats.sh_coeffs.into_value();
 
     // Fold the 3D-filter floor into scales/opacity first (the floor is part of
@@ -424,6 +425,7 @@ pub async fn render_splats(
         transforms.into_dispatch(),
         sh_coeffs.into_dispatch(),
         raw_opacities.into_dispatch(),
+        storage_sh_degree,
         render_mode,
         background,
         pass,

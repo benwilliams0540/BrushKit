@@ -281,6 +281,7 @@ async fn load_dataset_inner(
 
         Some(SplatMessage {
             meta: ParseMetadata {
+                progressive_sh_checkpoint: None,
                 up_axis: None,
                 render_mode: None,
                 total_splats: n_splats as u32,

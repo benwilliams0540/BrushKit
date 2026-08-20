@@ -2,6 +2,8 @@ use clap::{Args, Parser};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::progressive_sh::ProgressiveShSchedule;
+
 /// Host-only controls used by additive native ABIs. These are intentionally
 /// excluded from CLI/args-file serialization so existing callers retain their
 /// exact defaults and behavior.
@@ -22,6 +24,9 @@ pub struct HostRuntimeConfig {
     /// Zero-based training iteration that switches from the reduced image scale
     /// to the configured full resolution. `0` disables the transition.
     pub progressive_resolution_switch_iteration: u32,
+    /// Present only for the additive V4 callable ABI. `None` leaves the
+    /// released fixed-degree path byte-for-behavior unchanged.
+    pub progressive_sh_schedule: Option<ProgressiveShSchedule>,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

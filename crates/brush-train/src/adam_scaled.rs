@@ -211,3 +211,117 @@ impl AdaptiveMomentum {
         (grad, state)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::TensorData;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[cfg(target_family = "wasm")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn zero_scaled_inactive_coefficients_preserve_parameters_and_moments() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let optimizer = AdamScaled {
+            momentum: AdaptiveMomentum {
+                beta_1: 0.9,
+                beta_2: 0.999,
+                epsilon: 1e-8,
+            },
+            weight_decay: None,
+        };
+        let tensor = Tensor::<3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0], [1, 4, 1]),
+            &device,
+        );
+        let gradient = Tensor::<3>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0, 0.0], [1, 4, 1]),
+            &device,
+        );
+        let state = AdamState {
+            momentum: None,
+            scaling: Some(Tensor::<3>::from_data(
+                TensorData::new(vec![1.0, 0.0, 0.0, 0.0], [1, 4, 1]),
+                &device,
+            )),
+            reduce_moment_2: false,
+        };
+
+        let (updated, state) = optimizer.step(0.1, tensor, gradient, Some(state));
+        let updated_values = updated
+            .into_data_async()
+            .await
+            .expect("parameter readback")
+            .into_vec::<f32>()
+            .expect("parameter values");
+        assert_eq!(&updated_values[1..], &[2.0, 3.0, 4.0]);
+
+        let mut state = state.expect("optimizer state");
+        let momentum = state.momentum.as_ref().expect("momentum state");
+        let moment_1 = momentum
+            .moment_1
+            .clone()
+            .into_data_async()
+            .await
+            .expect("first moment readback")
+            .into_vec::<f32>()
+            .expect("first moment values");
+        let moment_2 = momentum
+            .moment_2
+            .clone()
+            .into_data_async()
+            .await
+            .expect("second moment readback")
+            .into_vec::<f32>()
+            .expect("second moment values");
+        assert!(moment_1[1..].iter().all(|value| *value == 0.0));
+        assert!(moment_2[1..].iter().all(|value| *value == 0.0));
+
+        // Activation replaces only the learning-rate mask. Parameters and zero
+        // moments are preserved; the optimizer's shared time continues.
+        state.scaling = Some(Tensor::<3>::from_data(
+            TensorData::new(vec![1.0, 1.0, 0.0, 0.0], [1, 4, 1]),
+            &device,
+        ));
+        let activated_gradient = Tensor::<3>::from_data(
+            TensorData::new(vec![0.0, 1.0, 0.0, 0.0], [1, 4, 1]),
+            &device,
+        );
+        let activated_tensor =
+            Tensor::<3>::from_data(TensorData::new(updated_values, [1, 4, 1]), &device);
+        let (activated, activated_state) =
+            optimizer.step(0.1, activated_tensor, activated_gradient, Some(state));
+        let activated_values = activated
+            .into_data_async()
+            .await
+            .expect("activated parameter readback")
+            .into_vec::<f32>()
+            .expect("activated parameter values");
+        assert_ne!(activated_values[1], 2.0);
+        assert_eq!(&activated_values[2..], &[3.0, 4.0]);
+        let activated_momentum = activated_state
+            .expect("activated optimizer state")
+            .momentum
+            .expect("activated momentum");
+        let activated_moment_1 = activated_momentum
+            .moment_1
+            .into_data_async()
+            .await
+            .expect("activated first moment readback")
+            .into_vec::<f32>()
+            .expect("activated first moment values");
+        let activated_moment_2 = activated_momentum
+            .moment_2
+            .into_data_async()
+            .await
+            .expect("activated second moment readback")
+            .into_vec::<f32>()
+            .expect("activated second moment values");
+        assert_ne!(activated_moment_1[1], 0.0);
+        assert_ne!(activated_moment_2[1], 0.0);
+        assert!(activated_moment_1[2..].iter().all(|value| *value == 0.0));
+        assert!(activated_moment_2[2..].iter().all(|value| *value == 0.0));
+    }
+}

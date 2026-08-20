@@ -225,6 +225,7 @@ pub async fn render_splats(
     img_size: glam::UVec2,
     background: Vec3,
 ) -> SplatOutputDiff {
+    let active_sh_degree = splats.sh_degree();
     render_splats_impl(
         splats,
         camera,
@@ -232,6 +233,28 @@ pub async fn render_splats(
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
         false,
+        active_sh_degree,
+    )
+    .await
+}
+
+/// Render a full-storage splat tensor while evaluating and differentiating
+/// only coefficients through `active_sh_degree`.
+pub async fn render_splats_with_active_sh_degree(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    active_sh_degree: u32,
+) -> SplatOutputDiff {
+    render_splats_impl(
+        splats,
+        camera,
+        img_size,
+        background,
+        brush_render::gaussian_splats::RasterPass::Backward,
+        false,
+        active_sh_degree,
     )
     .await
 }
@@ -244,6 +267,7 @@ pub async fn render_splats_with_host_timing(
     img_size: glam::UVec2,
     background: Vec3,
 ) -> SplatOutputDiff {
+    let active_sh_degree = splats.sh_degree();
     render_splats_impl(
         splats,
         camera,
@@ -251,6 +275,26 @@ pub async fn render_splats_with_host_timing(
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
         true,
+        active_sh_degree,
+    )
+    .await
+}
+
+pub async fn render_splats_with_active_sh_degree_and_host_timing(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    active_sh_degree: u32,
+) -> SplatOutputDiff {
+    render_splats_impl(
+        splats,
+        camera,
+        img_size,
+        background,
+        brush_render::gaussian_splats::RasterPass::Backward,
+        true,
+        active_sh_degree,
     )
     .await
 }
@@ -266,7 +310,17 @@ pub async fn render_splats_with_pass(
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
 ) -> SplatOutputDiff {
-    render_splats_impl(splats, camera, img_size, background, pass, false).await
+    let active_sh_degree = splats.sh_degree();
+    render_splats_impl(
+        splats,
+        camera,
+        img_size,
+        background,
+        pass,
+        false,
+        active_sh_degree,
+    )
+    .await
 }
 
 async fn render_splats_impl(
@@ -276,6 +330,7 @@ async fn render_splats_impl(
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
     host_timing_enabled: bool,
+    active_sh_degree: u32,
 ) -> SplatOutputDiff {
     let wrapper_start = host_timing_enabled.then(Instant::now);
     splats.clone().validate_values().await;
@@ -337,6 +392,7 @@ async fn render_splats_impl(
         transforms_inner.clone(),
         sh_inner.clone(),
         raw_opac_inner.clone(),
+        active_sh_degree,
         render_mode,
         background,
         pass,
@@ -552,7 +608,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
 
         let client = transforms.client.clone();
         let num_points = transforms.shape[0];
-        let coeffs = sh_coeffs_for_degree(project_uniforms.sh_degree) as usize;
+        let coeffs = sh_coeffs_for_degree(project_uniforms.storage_sh_degree) as usize;
 
         let input_tensors = [
             transforms,

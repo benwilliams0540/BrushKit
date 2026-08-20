@@ -8,9 +8,11 @@ pub mod quant;
 // Re-export main functionality
 pub use export::{
     ExportError, SplatExportValidationReport, splat_to_ply, splat_to_ply_with_report,
+    splat_to_ply_with_report_and_metadata,
 };
 pub use import::{
-    ParseMetadata, SplatData, SplatMessage, load_splat_from_ply, stream_splat_from_ply,
+    ParseMetadata, ProgressiveShCheckpointMetadata, SplatData, SplatMessage, load_splat_from_ply,
+    stream_splat_from_ply,
 };
 pub use ply_gaussian::PlyGaussian;
 

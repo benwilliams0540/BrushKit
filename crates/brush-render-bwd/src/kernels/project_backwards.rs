@@ -110,7 +110,8 @@ pub fn project_backwards_kernel(
     v_refine_weight: &mut Tensor<f32>,
     u: ProjectUniforms,
     #[comptime] mip_splatting: bool,
-    #[comptime] sh_degree: u32,
+    #[comptime] storage_sh_degree: u32,
+    #[comptime] active_sh_degree: u32,
     #[comptime] camera_model: CameraModel,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
@@ -165,10 +166,10 @@ pub fn project_backwards_kernel(
     let u_world = mean.sub(u.camera_pos());
     let u_len = u_world.length();
     let v = u_world.scale(1.0f32 / u_len);
-    let coeff_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
+    let coeff_base = global_gid * comptime![num_sh_coeffs(storage_sh_degree) * 3u32];
     let v_color = Vec3A::new(v_color_r, v_color_g, v_color_b);
-    sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
-    let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_base, sh_degree, v, v_color);
+    sh_coeffs_to_color_vjp(v_coeffs, coeff_base, active_sh_degree, v, v_color);
+    let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_base, active_sh_degree, v, v_color);
     let v_dot_vv = v.dot(v_v_sh);
     let v_mean_from_sh = v_v_sh.sub(v.scale(v_dot_vv)).scale(1.0f32 / u_len);
 

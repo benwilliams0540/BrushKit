@@ -19,8 +19,96 @@ type StreamEmitter = TryStreamEmitter<SplatMessage, DeserializeError>;
 pub struct ParseMetadata {
     pub up_axis: Option<Vec3>,
     pub render_mode: Option<SplatRenderMode>,
+    pub progressive_sh_checkpoint: Option<ProgressiveShCheckpointMetadata>,
     pub total_splats: u32,
     pub progress: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgressiveShCheckpointMetadata {
+    pub version: u32,
+    pub schedule_identity: u64,
+    pub schedule_mode: u32,
+    pub maximum_degree: u32,
+    pub initial_degree: u32,
+    pub step_interval: u32,
+    pub total_iterations: u32,
+    pub completed_iterations: u32,
+    pub active_degree: u32,
+}
+
+impl ProgressiveShCheckpointMetadata {
+    pub const COMMENT_PREFIX: &'static str = "BrushKitProgressiveSH: ";
+
+    pub fn to_comment(self) -> String {
+        format!(
+            "{}version={};identity={:016x};mode={};maximum={};initial={};interval={};total={};completed={};active={}",
+            Self::COMMENT_PREFIX,
+            self.version,
+            self.schedule_identity,
+            self.schedule_mode,
+            self.maximum_degree,
+            self.initial_degree,
+            self.step_interval,
+            self.total_iterations,
+            self.completed_iterations,
+            self.active_degree,
+        )
+    }
+
+    fn parse_comment(comment: &str) -> Result<Option<Self>, String> {
+        let Some(fields) = comment.strip_prefix(Self::COMMENT_PREFIX) else {
+            return Ok(None);
+        };
+        let mut parsed = std::collections::HashMap::new();
+        const KNOWN_FIELDS: [&str; 9] = [
+            "version",
+            "identity",
+            "mode",
+            "maximum",
+            "initial",
+            "interval",
+            "total",
+            "completed",
+            "active",
+        ];
+        for field in fields.split(';') {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| "malformed progressive SH checkpoint comment".to_owned())?;
+            if !KNOWN_FIELDS.contains(&key) {
+                return Err(format!("unknown progressive SH checkpoint field {key}"));
+            }
+            if parsed.insert(key, value).is_some() {
+                return Err(format!("duplicate progressive SH checkpoint field {key}"));
+            }
+        }
+        let decimal = |key: &str| -> Result<u32, String> {
+            parsed
+                .get(key)
+                .ok_or_else(|| format!("missing progressive SH checkpoint field {key}"))?
+                .parse()
+                .map_err(|_parse_error| format!("invalid progressive SH checkpoint field {key}"))
+        };
+        let identity = u64::from_str_radix(
+            parsed
+                .get("identity")
+                .ok_or_else(|| "missing progressive SH checkpoint field identity".to_owned())?,
+            16,
+        )
+        .map_err(|_parse_error| "invalid progressive SH checkpoint field identity".to_owned())?;
+        Ok(Some(Self {
+            version: decimal("version")?,
+            schedule_identity: identity,
+            schedule_mode: decimal("mode")?,
+            maximum_degree: decimal("maximum")?,
+            initial_degree: decimal("initial")?,
+            step_interval: decimal("interval")?,
+            total_iterations: decimal("total")?,
+            completed_iterations: decimal("completed")?,
+            active_degree: decimal("active")?,
+        }))
+    }
 }
 
 /// Raw splat data parsed from a PLY file.
@@ -226,6 +314,25 @@ pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
             })
             .next_back();
 
+        let progressive_sh_checkpoint = header
+            .comments
+            .iter()
+            .filter_map(
+                |comment| match ProgressiveShCheckpointMetadata::parse_comment(comment) {
+                    Ok(Some(metadata)) => Some(Ok(metadata)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DeserializeError::custom)?;
+        if progressive_sh_checkpoint.len() > 1 {
+            return Err(DeserializeError::custom(
+                "multiple progressive SH checkpoint comments are not supported",
+            ));
+        }
+        let progressive_sh_checkpoint = progressive_sh_checkpoint.into_iter().next();
+
         // Check whether there is a vertex header that has at least XYZ.
         let has_vertex = header.elem_defs.iter().any(|el| el.name == "vertex");
 
@@ -254,6 +361,7 @@ pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
                     up_axis,
                     &emitter,
                     render_mode,
+                    progressive_sh_checkpoint,
                     &mut updater,
                 )
                 .await?;
@@ -266,6 +374,7 @@ pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
                     up_axis,
                     emitter,
                     render_mode,
+                    progressive_sh_checkpoint,
                     updater,
                 )
                 .await?;
@@ -292,6 +401,7 @@ async fn parse_ply<T: AsyncRead + Unpin>(
     up_axis: Option<Vec3>,
     emitter: &StreamEmitter,
     render_mode: Option<SplatRenderMode>,
+    progressive_sh_checkpoint: Option<ProgressiveShCheckpointMetadata>,
     update: &mut TimedUpdate,
 ) -> Result<(), DeserializeError> {
     let header = file
@@ -377,6 +487,7 @@ async fn parse_ply<T: AsyncRead + Unpin>(
                 up_axis,
                 progress: progress(row_index, total_splats),
                 render_mode,
+                progressive_sh_checkpoint,
             };
 
             if row_index == total_splats {
@@ -401,6 +512,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
     up_axis: Option<Vec3>,
     emitter: StreamEmitter,
     render_mode: Option<SplatRenderMode>,
+    progressive_sh_checkpoint: Option<ProgressiveShCheckpointMetadata>,
     mut update: TimedUpdate,
 ) -> Result<(), DeserializeError> {
     #[derive(Default, Deserialize)]
@@ -522,6 +634,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
                 up_axis,
                 progress,
                 render_mode,
+                progressive_sh_checkpoint,
             };
 
             let data = SplatData {
@@ -572,6 +685,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
             up_axis,
             progress: 1.0,
             render_mode,
+            progressive_sh_checkpoint,
         };
         let data = SplatData {
             means,
@@ -597,6 +711,46 @@ mod tests {
 
     #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[test]
+    fn progressive_sh_checkpoint_comment_is_strict_and_roundtrips() {
+        let metadata = ProgressiveShCheckpointMetadata {
+            version: 1,
+            schedule_identity: 0xfeed_face_cafe_beef,
+            schedule_mode: 1,
+            maximum_degree: 3,
+            initial_degree: 0,
+            step_interval: 150,
+            total_iterations: 600,
+            completed_iterations: 450,
+            active_degree: 2,
+        };
+        assert_eq!(
+            ProgressiveShCheckpointMetadata::parse_comment(&metadata.to_comment()).unwrap(),
+            Some(metadata)
+        );
+        assert!(
+            ProgressiveShCheckpointMetadata::parse_comment(
+                "BrushKitProgressiveSH: version=1;version=1"
+            )
+            .unwrap_err()
+            .contains("duplicate")
+        );
+        assert!(
+            ProgressiveShCheckpointMetadata::parse_comment(
+                "BrushKitProgressiveSH: version=1;identity=xyz"
+            )
+            .unwrap_err()
+            .contains("identity")
+        );
+        assert!(
+            ProgressiveShCheckpointMetadata::parse_comment(
+                "BrushKitProgressiveSH: version=1;identity=0;future=1"
+            )
+            .unwrap_err()
+            .contains("unknown")
+        );
+    }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_import_basic_functionality() {

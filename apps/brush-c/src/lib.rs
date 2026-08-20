@@ -4,6 +4,10 @@
 use brush_process::burn_init_setup;
 use brush_process::config::{HostRuntimeConfig, TrainStreamConfig};
 use brush_process::message::{InitializerRoute, TelemetryBoundary, TrainMessage};
+use brush_process::progressive_sh::{
+    PROGRESSIVE_SH_MODE_DISABLED, PROGRESSIVE_SH_MODE_INTERVAL, ProgressiveShSchedule,
+    ShTransitionReason,
+};
 use brush_process::{DataSource, create_process, message::ProcessMessage};
 use brush_render::gaussian_splats::SplatRenderMode;
 #[cfg(brushkit_cubecl_gpu_profile)]
@@ -31,6 +35,7 @@ pub enum TrainExitCode {
 
 pub const BRUSH_ABI_VERSION_V2: u32 = 2;
 pub const BRUSH_ABI_VERSION_V3: u32 = 3;
+pub const BRUSH_ABI_VERSION_V4: u32 = 4;
 pub const BRUSH_CAPABILITY_DATASET_BOUNDARIES_V2: u64 = 1 << 0;
 pub const BRUSH_CAPABILITY_INITIALIZER_AUDIT_V2: u64 = 1 << 1;
 pub const BRUSH_CAPABILITY_STEP_TIMINGS_V2: u64 = 1 << 2;
@@ -41,6 +46,7 @@ pub const BRUSH_CAPABILITY_GPU_MEMORY_V2: u64 = 1 << 6;
 pub const BRUSH_CAPABILITY_GPU_COMMAND_TIMING_V2: u64 = 1 << 7;
 pub const BRUSH_CAPABILITY_CPU_WAIT_TIMING_V2: u64 = 1 << 8;
 pub const BRUSH_CAPABILITY_TERMINAL_COMPACTION_V2: u64 = 1 << 9;
+pub const BRUSH_CAPABILITY_PROGRESSIVE_SH_V4: u64 = 1 << 10;
 pub const BRUSH_RENDER_MODE_DEFAULT_V2: u32 = 0;
 pub const BRUSH_RENDER_MODE_MIP_V2: u32 = 1;
 pub const BRUSH_SH_POLICY_PRESERVE_AND_ZERO_PAD_V2: u32 = 0;
@@ -147,6 +153,34 @@ pub struct TrainOptionsV3 {
     pub progressive_resolution_switch_iteration: u32,
 }
 
+/// Additive callable ABI for the one predeclared progressive-SH schedule.
+/// V2 and V3 remain available and retain their fixed-SH behavior.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrainOptionsV4 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub seed: u64,
+    pub render_mode: u32,
+    pub sh_degree: u32,
+    pub sh_policy: u32,
+    pub total_train_steps: u32,
+    pub refine_every: u32,
+    pub max_resolution: u32,
+    pub max_splats: u32,
+    pub export_every: u32,
+    pub output_path: *const c_char,
+    pub export_name: *const c_char,
+    pub initializer_path: *const c_char,
+    pub initializer_required: u8,
+    pub instrumentation_level: u32,
+    pub progressive_resolution_start_percent: u32,
+    pub progressive_resolution_switch_iteration: u32,
+    pub sh_schedule_mode: u32,
+    pub initial_sh_degree: u32,
+    pub sh_degree_step_interval: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BrushEventV2 {
@@ -230,6 +264,85 @@ impl BrushEventV2 {
             optimizer_ns: 0,
             densification_and_compaction_ns: 0,
             text: ptr::null(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushEventKindV4 {
+    Capabilities = 0,
+    Configuration = 1,
+    DatasetLoadStarted = 2,
+    DatasetLoadFinished = 3,
+    Initializer = 4,
+    TrainerInitializationStarted = 5,
+    TrainerInitializationFinished = 6,
+    Step = 7,
+    Refinement = 8,
+    CheckpointExportStarted = 9,
+    CheckpointExported = 10,
+    Terminal = 11,
+    TerminalCompaction = 12,
+    ActiveSHDegreeChanged = 13,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushSHScheduleModeV4 {
+    Disabled = 0,
+    Interval = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushSHTransitionReasonV4 {
+    None = 0,
+    Disabled = 1,
+    Initial = 2,
+    Scheduled = 3,
+    Resume = 4,
+}
+
+/// V4 wraps the complete V2 evidence payload and adds typed progressive-SH
+/// identity. `zero_based_iteration` is intentionally separate from the V2
+/// payload's historically human-step-oriented `iteration` field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BrushEventV4 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub kind: BrushEventKindV4,
+    pub base: BrushEventV2,
+    pub maximum_sh_degree: u32,
+    pub active_sh_degree: u32,
+    pub initial_sh_degree: u32,
+    pub sh_degree_step_interval: u32,
+    pub sh_schedule_mode: BrushSHScheduleModeV4,
+    pub zero_based_iteration: u32,
+    pub transition_reason: BrushSHTransitionReasonV4,
+    pub schedule_identity: u64,
+}
+
+impl BrushEventV4 {
+    fn from_v2(kind: BrushEventKindV4, base: BrushEventV2, state: &EventJobState) -> Self {
+        Self {
+            struct_size: mem::size_of::<Self>() as u32,
+            abi_version: BRUSH_ABI_VERSION_V4,
+            kind,
+            base,
+            maximum_sh_degree: state.maximum_sh_degree,
+            active_sh_degree: state.active_sh_degree,
+            initial_sh_degree: state.initial_sh_degree,
+            sh_degree_step_interval: state.sh_degree_step_interval,
+            sh_schedule_mode: match state.sh_schedule_mode {
+                PROGRESSIVE_SH_MODE_DISABLED => BrushSHScheduleModeV4::Disabled,
+                PROGRESSIVE_SH_MODE_INTERVAL => BrushSHScheduleModeV4::Interval,
+                _ => unreachable!("validated schedule mode"),
+            },
+            zero_based_iteration: state.zero_based_iteration,
+            transition_reason: BrushSHTransitionReasonV4::None,
+            schedule_identity: state.schedule_identity,
         }
     }
 }
@@ -337,6 +450,11 @@ struct OwnedTrainOptionsV3 {
     base: OwnedTrainOptionsV2,
     progressive_resolution_start_percent: u32,
     progressive_resolution_switch_iteration: u32,
+}
+
+struct OwnedTrainOptionsV4 {
+    base: OwnedTrainOptionsV3,
+    sh_schedule: ProgressiveShSchedule,
 }
 
 impl OwnedTrainOptions {
@@ -516,6 +634,7 @@ impl OwnedTrainOptionsV2 {
             phase0_telemetry: self.instrumentation_level == 1,
             progressive_resolution_start_percent: 100,
             progressive_resolution_switch_iteration: 0,
+            progressive_sh_schedule: None,
         };
         config
     }
@@ -601,6 +720,95 @@ impl OwnedTrainOptionsV3 {
     }
 }
 
+impl OwnedTrainOptionsV4 {
+    /// Copy and validate the complete V4 input before the worker starts.
+    unsafe fn copy_from(options: *const TrainOptionsV4) -> Result<Self, String> {
+        if options.is_null() {
+            return Err("V4 options pointer is null".to_owned());
+        }
+        // SAFETY: caller promises readable V4 storage; exact size is checked
+        // immediately after the copy.
+        let options = unsafe { *options };
+        if options.struct_size != mem::size_of::<TrainOptionsV4>() as u32 {
+            return Err(format!(
+                "V4 options struct_size {} does not match {}",
+                options.struct_size,
+                mem::size_of::<TrainOptionsV4>()
+            ));
+        }
+        if options.abi_version != BRUSH_ABI_VERSION_V4 {
+            return Err(format!(
+                "unsupported callable ABI version {}; expected {}",
+                options.abi_version, BRUSH_ABI_VERSION_V4
+            ));
+        }
+
+        let v3 = TrainOptionsV3 {
+            struct_size: mem::size_of::<TrainOptionsV3>() as u32,
+            abi_version: BRUSH_ABI_VERSION_V3,
+            seed: options.seed,
+            render_mode: options.render_mode,
+            sh_degree: options.sh_degree,
+            sh_policy: options.sh_policy,
+            total_train_steps: options.total_train_steps,
+            refine_every: options.refine_every,
+            max_resolution: options.max_resolution,
+            max_splats: options.max_splats,
+            export_every: options.export_every,
+            output_path: options.output_path,
+            export_name: options.export_name,
+            initializer_path: options.initializer_path,
+            initializer_required: options.initializer_required,
+            instrumentation_level: options.instrumentation_level,
+            progressive_resolution_start_percent: options.progressive_resolution_start_percent,
+            progressive_resolution_switch_iteration: options
+                .progressive_resolution_switch_iteration,
+        };
+        // SAFETY: `v3` is complete local storage and all string pointers are
+        // covered by the V4 caller contract.
+        let base = unsafe { OwnedTrainOptionsV3::copy_from(&v3) }?;
+        let sh_schedule = ProgressiveShSchedule::new(
+            options.sh_schedule_mode,
+            options.sh_degree,
+            options.initial_sh_degree,
+            options.sh_degree_step_interval,
+            options.total_train_steps,
+        )?;
+
+        match options.sh_schedule_mode {
+            PROGRESSIVE_SH_MODE_DISABLED => {}
+            PROGRESSIVE_SH_MODE_INTERVAL => {
+                if options.sh_degree != 3
+                    || options.initial_sh_degree != 0
+                    || options.sh_degree_step_interval != 150
+                    || options.total_train_steps != 600
+                {
+                    return Err(
+                        "V4 interval mode supports only the predeclared SH3 schedule: initial degree 0, 150-step interval, 600 total steps"
+                            .to_owned(),
+                    );
+                }
+            }
+            _ => unreachable!("schedule constructor rejected unknown mode"),
+        }
+
+        Ok(Self { base, sh_schedule })
+    }
+
+    fn schedule(&self) -> &ProgressiveShSchedule {
+        &self.sh_schedule
+    }
+
+    fn into_train_stream_config(self) -> TrainStreamConfig {
+        let progressive_enabled = self.sh_schedule.mode() == PROGRESSIVE_SH_MODE_INTERVAL;
+        let mut config = self.base.into_train_stream_config();
+        if progressive_enabled {
+            config.host_runtime.progressive_sh_schedule = Some(self.sh_schedule);
+        }
+        config
+    }
+}
+
 unsafe fn copy_optional_utf8(value: *const c_char, field: &str) -> Result<Option<String>, String> {
     if value.is_null() {
         return Ok(None);
@@ -616,6 +824,55 @@ unsafe fn copy_optional_utf8(value: *const c_char, field: &str) -> Result<Option
 pub type ProgressCallback =
     extern "C" fn(progress_message: ProgressMessage, user_data: *mut c_void);
 pub type ProgressCallbackV2 = extern "C" fn(event: BrushEventV2, user_data: *mut c_void);
+pub type ProgressCallbackV4 = extern "C" fn(event: BrushEventV4, user_data: *mut c_void);
+
+struct EventJobState {
+    started: Instant,
+    initial_primitive_count: u32,
+    last_primitive_count: u32,
+    terminal_exported_primitive_count: Option<u32>,
+    maximum_sh_degree: u32,
+    active_sh_degree: u32,
+    initial_sh_degree: u32,
+    sh_degree_step_interval: u32,
+    sh_schedule_mode: u32,
+    schedule_identity: u64,
+    zero_based_iteration: u32,
+}
+
+impl EventJobState {
+    fn v2(started: Instant) -> Self {
+        Self {
+            started,
+            initial_primitive_count: 0,
+            last_primitive_count: 0,
+            terminal_exported_primitive_count: None,
+            maximum_sh_degree: 0,
+            active_sh_degree: 0,
+            initial_sh_degree: 0,
+            sh_degree_step_interval: 0,
+            sh_schedule_mode: PROGRESSIVE_SH_MODE_DISABLED,
+            schedule_identity: 0,
+            zero_based_iteration: 0,
+        }
+    }
+
+    fn v4(started: Instant, schedule: &ProgressiveShSchedule) -> Self {
+        Self {
+            started,
+            initial_primitive_count: 0,
+            last_primitive_count: 0,
+            terminal_exported_primitive_count: None,
+            maximum_sh_degree: schedule.maximum_degree(),
+            active_sh_degree: schedule.active_degree_at(0),
+            initial_sh_degree: schedule.initial_degree(),
+            sh_degree_step_interval: schedule.step_interval(),
+            sh_schedule_mode: schedule.mode(),
+            schedule_identity: schedule.identity(),
+            zero_based_iteration: 0,
+        }
+    }
+}
 
 enum JobCallback {
     Legacy {
@@ -625,10 +882,12 @@ enum JobCallback {
     V2 {
         callback: ProgressCallbackV2,
         user_data_address: usize,
-        started: Instant,
-        initial_primitive_count: u32,
-        last_primitive_count: u32,
-        terminal_exported_primitive_count: Option<u32>,
+        state: EventJobState,
+    },
+    V4 {
+        callback: ProgressCallbackV4,
+        user_data_address: usize,
+        state: EventJobState,
     },
 }
 
@@ -810,10 +1069,7 @@ pub unsafe extern "C" fn brush_train_start_v2(
                 JobCallback::V2 {
                     callback: progress_callback,
                     user_data_address,
-                    started,
-                    initial_primitive_count: 0,
-                    last_primitive_count: 0,
-                    terminal_exported_primitive_count: None,
+                    state: EventJobState::v2(started),
                 },
                 &worker_cancellation,
             )
@@ -896,10 +1152,7 @@ pub unsafe extern "C" fn brush_train_start_v3(
                 JobCallback::V2 {
                     callback: progress_callback,
                     user_data_address,
-                    started,
-                    initial_primitive_count: 0,
-                    last_primitive_count: 0,
-                    terminal_exported_primitive_count: None,
+                    state: EventJobState::v2(started),
                 },
                 &worker_cancellation,
             )
@@ -908,6 +1161,94 @@ pub unsafe extern "C" fn brush_train_start_v3(
         let mut event = BrushEventV2::new(BrushEventKindV2::Terminal, 0);
         event.error_code = BrushErrorCodeV2::Training;
         emit_v2_with_text(
+            progress_callback,
+            user_data_address,
+            event,
+            "failed to create training worker",
+        );
+        return ptr::null_mut();
+    };
+
+    let state = Arc::new(BrushJobState {
+        cancellation_requested,
+        completion: Mutex::new(JobCompletion {
+            handle: Some(handle),
+            result: None,
+            joining: false,
+        }),
+        completion_changed: Condvar::new(),
+    });
+    Box::into_raw(Box::new(state)).cast::<BrushJobV2>()
+}
+
+/// Starts a callable ABI V4 training job. V4 adds the default-disabled,
+/// predeclared progressive-SH schedule and typed V4 events while reusing the
+/// retained V2 job ownership functions.
+///
+/// # Safety
+/// All non-null string pointers must remain readable for this call. `user_data`
+/// must remain valid until a terminal callback or until the final retained job
+/// handle has been released after waiting.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn brush_train_start_v4(
+    dataset_path: *const c_char,
+    options: *const TrainOptionsV4,
+    progress_callback: ProgressCallbackV4,
+    user_data: *mut c_void,
+) -> *mut BrushJobV2 {
+    let started = Instant::now();
+    let dataset_path = if dataset_path.is_null() {
+        Err("dataset_path pointer is null".to_owned())
+    } else {
+        // SAFETY: caller guarantees a null-terminated C string.
+        unsafe { CStr::from_ptr(dataset_path) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_utf8_error| "dataset_path is not valid UTF-8".to_owned())
+    };
+    // SAFETY: forwarded V4 pointer contract.
+    let options = unsafe { OwnedTrainOptionsV4::copy_from(options) };
+    let (dataset_path, train_options) = match (dataset_path, options) {
+        (Ok(dataset_path), Ok(options)) => (dataset_path, options),
+        (dataset_path, options) => {
+            let detail = dataset_path.err().or_else(|| options.err()).unwrap();
+            let mut base = BrushEventV2::new(BrushEventKindV2::Terminal, 0);
+            base.error_code = if detail.contains("ABI version") {
+                BrushErrorCodeV2::UnsupportedAbi
+            } else {
+                BrushErrorCodeV2::InvalidArgument
+            };
+            let state = EventJobState::v2(started);
+            let event = BrushEventV4::from_v2(BrushEventKindV4::Terminal, base, &state);
+            emit_v4_with_text(progress_callback, user_data as usize, event, &detail);
+            return ptr::null_mut();
+        }
+    };
+
+    let event_state = EventJobState::v4(started, train_options.schedule());
+    let cancellation_requested = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation_requested);
+    let user_data_address = user_data as usize;
+    let Ok(handle) = std::thread::Builder::new()
+        .name("brush-c-train-v4".to_owned())
+        .spawn(move || {
+            run_training_job_v4(
+                dataset_path,
+                train_options,
+                JobCallback::V4 {
+                    callback: progress_callback,
+                    user_data_address,
+                    state: event_state,
+                },
+                &worker_cancellation,
+            )
+        })
+    else {
+        let mut base = BrushEventV2::new(BrushEventKindV2::Terminal, 0);
+        base.error_code = BrushErrorCodeV2::Training;
+        let state = EventJobState::v2(started);
+        let event = BrushEventV4::from_v2(BrushEventKindV4::Terminal, base, &state);
+        emit_v4_with_text(
             progress_callback,
             user_data_address,
             event,
@@ -1097,6 +1438,29 @@ pub unsafe extern "C" fn train_and_save_v2(
     status
 }
 
+/// Blocking convenience wrapper for callable ABI V4.
+///
+/// # Safety
+/// This forwards the complete `brush_train_start_v4` pointer contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn train_and_save_v4(
+    dataset_path: *const c_char,
+    options: *const TrainOptionsV4,
+    progress_callback: ProgressCallbackV4,
+    user_data: *mut c_void,
+) -> TrainExitCode {
+    // SAFETY: forwards the caller's V4 FFI contract.
+    let job = unsafe { brush_train_start_v4(dataset_path, options, progress_callback, user_data) };
+    if job.is_null() {
+        return TrainExitCode::Error;
+    }
+    // SAFETY: job is live until the matching release below.
+    let status = unsafe { brush_job_wait_v2(job) };
+    // SAFETY: release the one owner returned by start.
+    unsafe { brush_job_release_v2(job) };
+    status
+}
+
 fn job_state<'a>(job: *mut BrushJob) -> Option<&'a BrushJobState> {
     if job.is_null() {
         return None;
@@ -1190,6 +1554,21 @@ fn run_training_job_v3(
     )
 }
 
+fn run_training_job_v4(
+    dataset_path: String,
+    train_options: OwnedTrainOptionsV4,
+    callback: JobCallback,
+    cancellation_requested: &AtomicBool,
+) -> TrainExitCode {
+    run_training_job_with_config(
+        dataset_path,
+        train_options.into_train_stream_config(),
+        callback,
+        cancellation_requested,
+        true,
+    )
+}
+
 fn run_training_job_with_config(
     dataset_path: String,
     process_args: TrainStreamConfig,
@@ -1197,7 +1576,7 @@ fn run_training_job_with_config(
     cancellation_requested: &AtomicBool,
     serialize_v2: bool,
 ) -> TrainExitCode {
-    if let JobCallback::V2 { .. } = callback {
+    if matches!(callback, JobCallback::V2 { .. } | JobCallback::V4 { .. }) {
         emit_v2_capabilities(&callback);
         emit_v2_configuration(&callback, &process_args);
     }
@@ -1299,7 +1678,7 @@ fn configure_cubecl_gpu_profile(phase0_telemetry_requested: bool) {
 fn configure_cubecl_gpu_profile(_phase0_telemetry_requested: bool) {}
 
 fn emit_progress_message(message: ProcessMessage, callback: &mut JobCallback) {
-    if matches!(callback, JobCallback::V2 { .. }) {
+    if matches!(callback, JobCallback::V2 { .. } | JobCallback::V4 { .. }) {
         emit_progress_message_v2(&message, callback);
         return;
     }
@@ -1358,8 +1737,24 @@ fn duration_ns(duration: impl Into<std::time::Duration>) -> u64 {
 
 fn v2_timestamp(callback: &JobCallback) -> u64 {
     match callback {
-        JobCallback::V2 { started, .. } => duration_ns(started.elapsed()),
+        JobCallback::V2 { state, .. } | JobCallback::V4 { state, .. } => {
+            duration_ns(state.started.elapsed())
+        }
         JobCallback::Legacy { .. } => 0,
+    }
+}
+
+fn event_state(callback: &JobCallback) -> Option<&EventJobState> {
+    match callback {
+        JobCallback::V2 { state, .. } | JobCallback::V4 { state, .. } => Some(state),
+        JobCallback::Legacy { .. } => None,
+    }
+}
+
+fn event_state_mut(callback: &mut JobCallback) -> Option<&mut EventJobState> {
+    match callback {
+        JobCallback::V2 { state, .. } | JobCallback::V4 { state, .. } => Some(state),
+        JobCallback::Legacy { .. } => None,
     }
 }
 
@@ -1374,25 +1769,75 @@ fn emit_v2_with_text(
     callback(event, user_data_address as *mut c_void);
 }
 
+fn emit_v4_with_text(
+    callback: ProgressCallbackV4,
+    user_data_address: usize,
+    mut event: BrushEventV4,
+    text: &str,
+) {
+    let text = CString::new(text.replace('\0', "�")).ok();
+    event.base.text = text.as_ref().map_or(ptr::null(), |text| text.as_ptr());
+    callback(event, user_data_address as *mut c_void);
+}
+
+fn v4_kind(kind: BrushEventKindV2) -> BrushEventKindV4 {
+    match kind {
+        BrushEventKindV2::Capabilities => BrushEventKindV4::Capabilities,
+        BrushEventKindV2::Configuration => BrushEventKindV4::Configuration,
+        BrushEventKindV2::DatasetLoadStarted => BrushEventKindV4::DatasetLoadStarted,
+        BrushEventKindV2::DatasetLoadFinished => BrushEventKindV4::DatasetLoadFinished,
+        BrushEventKindV2::Initializer => BrushEventKindV4::Initializer,
+        BrushEventKindV2::TrainerInitializationStarted => {
+            BrushEventKindV4::TrainerInitializationStarted
+        }
+        BrushEventKindV2::TrainerInitializationFinished => {
+            BrushEventKindV4::TrainerInitializationFinished
+        }
+        BrushEventKindV2::Step => BrushEventKindV4::Step,
+        BrushEventKindV2::Refinement => BrushEventKindV4::Refinement,
+        BrushEventKindV2::CheckpointExportStarted => BrushEventKindV4::CheckpointExportStarted,
+        BrushEventKindV2::CheckpointExported => BrushEventKindV4::CheckpointExported,
+        BrushEventKindV2::Terminal => BrushEventKindV4::Terminal,
+        BrushEventKindV2::TerminalCompaction => BrushEventKindV4::TerminalCompaction,
+    }
+}
+
 fn emit_v2(callback: &JobCallback, event: BrushEventV2, text: Option<&str>) {
-    let JobCallback::V2 {
-        callback,
-        user_data_address,
-        ..
-    } = callback
-    else {
-        return;
-    };
-    if let Some(text) = text {
-        emit_v2_with_text(*callback, *user_data_address, event, text);
-    } else {
-        callback(event, *user_data_address as *mut c_void);
+    match callback {
+        JobCallback::V2 {
+            callback,
+            user_data_address,
+            ..
+        } => {
+            if let Some(text) = text {
+                emit_v2_with_text(*callback, *user_data_address, event, text);
+            } else {
+                callback(event, *user_data_address as *mut c_void);
+            }
+        }
+        JobCallback::V4 {
+            callback,
+            user_data_address,
+            state,
+        } => {
+            let kind = v4_kind(event.kind);
+            let event = BrushEventV4::from_v2(kind, event, state);
+            if let Some(text) = text {
+                emit_v4_with_text(*callback, *user_data_address, event, text);
+            } else {
+                callback(event, *user_data_address as *mut c_void);
+            }
+        }
+        JobCallback::Legacy { .. } => {}
     }
 }
 
 fn emit_v2_capabilities(callback: &JobCallback) {
     let mut event = BrushEventV2::new(BrushEventKindV2::Capabilities, v2_timestamp(callback));
     event.capability_flags = BRUSH_AVAILABLE_CAPABILITIES_V2;
+    if matches!(callback, JobCallback::V4 { .. }) {
+        event.capability_flags |= BRUSH_CAPABILITY_PROGRESSIVE_SH_V4;
+    }
     emit_v2(
         callback,
         event,
@@ -1451,16 +1896,10 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
                 InitializerRoute::ExplicitPly => BrushInitializerRouteV2::ExplicitPly,
                 InitializerRoute::ExplicitStrong => BrushInitializerRouteV2::ExplicitStrong,
             };
-            if let JobCallback::V2 {
-                initial_primitive_count,
-                last_primitive_count,
-                terminal_exported_primitive_count,
-                ..
-            } = callback
-            {
-                *initial_primitive_count = report.primitive_count;
-                *last_primitive_count = report.primitive_count;
-                *terminal_exported_primitive_count = None;
+            if let Some(state) = event_state_mut(callback) {
+                state.initial_primitive_count = report.primitive_count;
+                state.last_primitive_count = report.primitive_count;
+                state.terminal_exported_primitive_count = None;
             }
             event_and_text = Some((
                 event,
@@ -1496,12 +1935,9 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             event.loss_and_ssim_ns = duration_ns(*loss_duration);
             event.backward_ns = duration_ns(*backward_duration);
             event.optimizer_ns = duration_ns(*optimizer_duration);
-            if let JobCallback::V2 {
-                last_primitive_count,
-                ..
-            } = callback
-            {
-                *last_primitive_count = *live_splat_count;
+            if let Some(state) = event_state_mut(callback) {
+                state.last_primitive_count = *live_splat_count;
+                state.zero_based_iteration = iter.saturating_sub(1);
             }
             let optimizer_substage_text = optimizer_transforms_duration
                 .as_ref()
@@ -1560,12 +1996,8 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             event.pruned_non_finite_count = *num_pruned_non_finite;
             event.net_growth = i64::from(*num_added) - i64::from(*num_pruned);
             event.densification_and_compaction_ns = duration_ns(*duration);
-            if let JobCallback::V2 {
-                last_primitive_count,
-                ..
-            } = callback
-            {
-                *last_primitive_count = *cur_splat_count;
+            if let Some(state) = event_state_mut(callback) {
+                state.last_primitive_count = *cur_splat_count;
             }
             event_and_text = Some((event, None));
         }
@@ -1587,14 +2019,9 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
             event.pruned_non_finite_count = report.pruned_non_finite_count;
             event.net_growth = -i64::from(report.pruned_non_finite_count);
             event.densification_and_compaction_ns = duration_ns(report.validation_duration);
-            if let JobCallback::V2 {
-                last_primitive_count,
-                terminal_exported_primitive_count,
-                ..
-            } = callback
-            {
-                *last_primitive_count = report.exported_splat_count;
-                *terminal_exported_primitive_count = Some(report.exported_splat_count);
+            if let Some(state) = event_state_mut(callback) {
+                state.last_primitive_count = report.exported_splat_count;
+                state.terminal_exported_primitive_count = Some(report.exported_splat_count);
             }
             event_and_text = Some((
                 event,
@@ -1607,6 +2034,49 @@ fn emit_progress_message_v2(message: &ProcessMessage, callback: &mut JobCallback
                     report.opacity_non_finite_row_count,
                 )),
             ));
+        }
+        ProcessMessage::TrainMessage(TrainMessage::ShDegreeChanged {
+            zero_based_iteration,
+            maximum_degree,
+            active_degree,
+            initial_degree,
+            step_interval,
+            schedule_mode,
+            schedule_identity,
+            reason,
+        }) => {
+            if matches!(callback, JobCallback::V4 { .. }) {
+                let timestamp = v2_timestamp(callback);
+                let state = event_state_mut(callback).expect("V4 callback has event state");
+                state.maximum_sh_degree = *maximum_degree;
+                state.active_sh_degree = *active_degree;
+                state.initial_sh_degree = *initial_degree;
+                state.sh_degree_step_interval = *step_interval;
+                state.sh_schedule_mode = *schedule_mode;
+                state.schedule_identity = *schedule_identity;
+                state.zero_based_iteration = *zero_based_iteration;
+                let mut base = BrushEventV2::new(BrushEventKindV2::Configuration, timestamp);
+                base.iteration = *zero_based_iteration;
+                base.configured_sh_degree = *maximum_degree;
+                let JobCallback::V4 {
+                    callback,
+                    user_data_address,
+                    state,
+                } = callback
+                else {
+                    unreachable!();
+                };
+                let mut event =
+                    BrushEventV4::from_v2(BrushEventKindV4::ActiveSHDegreeChanged, base, state);
+                event.zero_based_iteration = *zero_based_iteration;
+                event.transition_reason = match reason {
+                    ShTransitionReason::Disabled => BrushSHTransitionReasonV4::Disabled,
+                    ShTransitionReason::Initial => BrushSHTransitionReasonV4::Initial,
+                    ShTransitionReason::Scheduled => BrushSHTransitionReasonV4::Scheduled,
+                    ShTransitionReason::Resume => BrushSHTransitionReasonV4::Resume,
+                };
+                callback(event, *user_data_address as *mut c_void);
+            }
         }
         _ => {}
     }
@@ -1624,16 +2094,11 @@ fn emit_v2_terminal(
 ) {
     let mut event = BrushEventV2::new(BrushEventKindV2::Terminal, v2_timestamp(callback));
     event.error_code = error_code;
-    if let JobCallback::V2 {
-        initial_primitive_count,
-        last_primitive_count,
-        terminal_exported_primitive_count,
-        ..
-    } = callback
-    {
-        event.initial_primitive_count = *initial_primitive_count;
-        event.final_primitive_count =
-            terminal_exported_primitive_count.unwrap_or(*last_primitive_count);
+    if let Some(state) = event_state(callback) {
+        event.initial_primitive_count = state.initial_primitive_count;
+        event.final_primitive_count = state
+            .terminal_exported_primitive_count
+            .unwrap_or(state.last_primitive_count);
     }
     if status == TrainExitCode::Cancelled && event.error_code == BrushErrorCodeV2::None {
         event.error_code = BrushErrorCodeV2::Cancelled;
@@ -1652,16 +2117,168 @@ mod tests {
         unsafe { &mut *user_data.cast::<Vec<BrushEventV2>>() }.push(event);
     }
 
+    extern "C" fn collect_event_v4(event: BrushEventV4, user_data: *mut c_void) {
+        // SAFETY: the test keeps this Vec alive for every synchronous callback.
+        unsafe { &mut *user_data.cast::<Vec<BrushEventV4>>() }.push(event);
+    }
+
+    fn v4_options(mode: u32) -> TrainOptionsV4 {
+        let enabled = mode == PROGRESSIVE_SH_MODE_INTERVAL;
+        TrainOptionsV4 {
+            struct_size: mem::size_of::<TrainOptionsV4>() as u32,
+            abi_version: BRUSH_ABI_VERSION_V4,
+            seed: 0,
+            render_mode: BRUSH_RENDER_MODE_DEFAULT_V2,
+            sh_degree: 3,
+            sh_policy: BRUSH_SH_POLICY_PRESERVE_AND_ZERO_PAD_V2,
+            total_train_steps: if enabled { 600 } else { 10 },
+            refine_every: 200,
+            max_resolution: 720,
+            max_splats: 500_000,
+            export_every: if enabled { 600 } else { 10 },
+            output_path: ptr::null(),
+            export_name: ptr::null(),
+            initializer_path: ptr::null(),
+            initializer_required: 0,
+            instrumentation_level: BRUSH_INSTRUMENTATION_DISABLED_V2,
+            progressive_resolution_start_percent: 100,
+            progressive_resolution_switch_iteration: 0,
+            sh_schedule_mode: mode,
+            initial_sh_degree: if enabled { 0 } else { 3 },
+            sh_degree_step_interval: if enabled { 150 } else { 0 },
+        }
+    }
+
+    #[test]
+    fn released_layouts_are_unchanged_and_v4_is_explicit() {
+        assert_eq!(mem::size_of::<TrainOptionsV2>(), 80);
+        assert_eq!(mem::size_of::<TrainOptionsV3>(), 88);
+        assert_eq!(mem::size_of::<BrushEventV2>(), 200);
+        assert_eq!(mem::size_of::<TrainOptionsV4>(), 104);
+        assert_eq!(mem::size_of::<BrushEventV4>(), 256);
+        assert_eq!(brush_get_abi_version(), BRUSH_ABI_VERSION_V2);
+    }
+
+    #[test]
+    fn v4_accepts_only_disabled_or_the_predeclared_schedule() {
+        let disabled = v4_options(PROGRESSIVE_SH_MODE_DISABLED);
+        // SAFETY: local exact V4 storage and null optional strings.
+        let disabled = unsafe { OwnedTrainOptionsV4::copy_from(&disabled) }.unwrap();
+        assert_eq!(disabled.schedule().mode(), PROGRESSIVE_SH_MODE_DISABLED);
+        assert!(
+            disabled
+                .into_train_stream_config()
+                .host_runtime
+                .progressive_sh_schedule
+                .is_none(),
+            "disabled V4 must use the existing fixed-SH engine path"
+        );
+
+        let enabled = v4_options(PROGRESSIVE_SH_MODE_INTERVAL);
+        // SAFETY: local exact V4 storage and null optional strings.
+        let enabled = unsafe { OwnedTrainOptionsV4::copy_from(&enabled) }.unwrap();
+        assert_eq!(
+            enabled.schedule().transitions(),
+            &[(0, 0), (150, 1), (300, 2), (450, 3)]
+        );
+
+        let mut invalid = v4_options(PROGRESSIVE_SH_MODE_INTERVAL);
+        invalid.sh_degree_step_interval = 149;
+        // SAFETY: local exact V4 storage and null optional strings.
+        let error = unsafe { OwnedTrainOptionsV4::copy_from(&invalid) }
+            .err()
+            .unwrap();
+        assert!(error.contains("predeclared SH3 schedule"));
+        let mut invalid = v4_options(99);
+        // Avoid the helper's disabled field defaults disguising the mode error.
+        invalid.initial_sh_degree = 0;
+        invalid.sh_degree_step_interval = 150;
+        // SAFETY: local exact V4 storage and null optional strings.
+        let error = unsafe { OwnedTrainOptionsV4::copy_from(&invalid) }
+            .err()
+            .unwrap();
+        assert!(error.contains("unsupported progressive SH schedule mode"));
+        let mut malformed = v4_options(PROGRESSIVE_SH_MODE_INTERVAL);
+        malformed.struct_size -= 1;
+        // SAFETY: local readable storage; malformed size is intentionally rejected.
+        let error = unsafe { OwnedTrainOptionsV4::copy_from(&malformed) }
+            .err()
+            .unwrap();
+        assert!(error.contains("struct_size"));
+    }
+
+    #[test]
+    fn v4_transition_events_are_typed_and_ordered_before_their_steps() {
+        let schedule =
+            ProgressiveShSchedule::new(PROGRESSIVE_SH_MODE_INTERVAL, 3, 0, 150, 600).unwrap();
+        let mut events = Vec::<BrushEventV4>::new();
+        let mut callback = JobCallback::V4 {
+            callback: collect_event_v4,
+            user_data_address: std::ptr::from_mut(&mut events) as usize,
+            state: EventJobState::v4(Instant::now(), &schedule),
+        };
+        for (iteration, degree) in schedule.transitions() {
+            emit_progress_message_v2(
+                &ProcessMessage::TrainMessage(TrainMessage::ShDegreeChanged {
+                    zero_based_iteration: *iteration,
+                    maximum_degree: 3,
+                    active_degree: *degree,
+                    initial_degree: 0,
+                    step_interval: 150,
+                    schedule_mode: PROGRESSIVE_SH_MODE_INTERVAL,
+                    schedule_identity: schedule.identity(),
+                    reason: if *iteration == 0 {
+                        ShTransitionReason::Initial
+                    } else {
+                        ShTransitionReason::Scheduled
+                    },
+                }),
+                &mut callback,
+            );
+            emit_progress_message_v2(
+                &ProcessMessage::TrainMessage(TrainMessage::TrainStep {
+                    iter: *iteration + 1,
+                    total_elapsed: std::time::Duration::ZERO,
+                    step_duration: std::time::Duration::ZERO,
+                    data_wait_duration: std::time::Duration::ZERO,
+                    forward_duration: std::time::Duration::ZERO,
+                    loss_duration: std::time::Duration::ZERO,
+                    backward_duration: std::time::Duration::ZERO,
+                    optimizer_duration: std::time::Duration::ZERO,
+                    optimizer_transforms_duration: None,
+                    optimizer_sh_coeffs_duration: None,
+                    optimizer_opacity_duration: None,
+                    render_before_count_readback_duration: None,
+                    render_count_readback_duration: None,
+                    render_after_count_readback_duration: None,
+                    live_splat_count: 1,
+                    lod_progress: None,
+                }),
+                &mut callback,
+            );
+        }
+        assert_eq!(events.len(), 8);
+        for (index, (iteration, degree)) in schedule.transitions().iter().enumerate() {
+            let transition = events[index * 2];
+            let step = events[index * 2 + 1];
+            assert_eq!(transition.kind, BrushEventKindV4::ActiveSHDegreeChanged);
+            assert_eq!(transition.zero_based_iteration, *iteration);
+            assert_eq!(transition.active_sh_degree, *degree);
+            assert_eq!(transition.maximum_sh_degree, 3);
+            assert_eq!(transition.schedule_identity, schedule.identity());
+            assert_eq!(step.kind, BrushEventKindV4::Step);
+            assert_eq!(step.base.iteration, *iteration + 1);
+            assert_eq!(step.active_sh_degree, *degree);
+        }
+    }
+
     #[test]
     fn terminal_count_uses_export_compaction_after_delayed_step() {
         let mut events: Vec<BrushEventV2> = Vec::new();
         let mut callback = JobCallback::V2 {
             callback: collect_event,
             user_data_address: std::ptr::from_mut(&mut events) as usize,
-            started: Instant::now(),
-            initial_primitive_count: 0,
-            last_primitive_count: 0,
-            terminal_exported_primitive_count: None,
+            state: EventJobState::v2(Instant::now()),
         };
 
         emit_progress_message_v2(

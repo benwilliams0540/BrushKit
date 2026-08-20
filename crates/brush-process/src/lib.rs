@@ -1,6 +1,7 @@
 pub mod args_file;
 pub mod config;
 pub mod message;
+pub mod progressive_sh;
 pub mod slot;
 pub mod train_stream;
 

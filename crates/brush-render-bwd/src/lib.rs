@@ -4,5 +4,6 @@ mod render_bwd;
 
 pub use burn_glue::{
     RasterizeGrads, SplatBwdOps, SplatGrads, SplatOutputDiff, render_splats,
+    render_splats_with_active_sh_degree, render_splats_with_active_sh_degree_and_host_timing,
     render_splats_with_host_timing, render_splats_with_pass,
 };

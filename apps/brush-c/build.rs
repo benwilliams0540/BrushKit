@@ -49,7 +49,7 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_owned());
     let crate_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_owned());
     let provenance = format!(
-        "format=brushkit-build-provenance-v1;engine_source_sha={revision};crate_version={crate_version};callable_abi=2;additive_train_abi=3;apple_features={features};cubecl_gpu_profile={};rustc={rustc_version};target={target}",
+        "format=brushkit-build-provenance-v1;engine_source_sha={revision};crate_version={crate_version};callable_abi=2;additive_train_abi=4;apple_features={features};cubecl_gpu_profile={};rustc={rustc_version};target={target}",
         if cubecl_gpu_profile { "on" } else { "off" }
     );
     println!("cargo:rustc-env=BRUSHKIT_BUILD_PROVENANCE={provenance}");

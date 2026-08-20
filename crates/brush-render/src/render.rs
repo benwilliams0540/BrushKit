@@ -47,6 +47,7 @@ impl SplatOps for MainBackendBase {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        active_sh_degree: u32,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: RasterPass,
@@ -70,7 +71,11 @@ impl SplatOps for MainBackendBase {
             .check_dims("raw_opacities", &raw_opacities, &["D".into()]);
 
         let total_splats = transforms.shape()[0] as u32;
-        let sh_degree = sh_degree_from_coeffs(sh_coeffs.shape()[1] as u32);
+        let storage_sh_degree = sh_degree_from_coeffs(sh_coeffs.shape()[1] as u32);
+        assert!(
+            active_sh_degree <= storage_sh_degree,
+            "active SH degree {active_sh_degree} exceeds storage degree {storage_sh_degree}"
+        );
         let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
 
         let half_max_render_fov =
@@ -85,7 +90,8 @@ impl SplatOps for MainBackendBase {
             camera_position: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             img_size: img_size.into(),
             tile_bounds: calc_tile_bounds(img_size).into(),
-            sh_degree,
+            sh_degree: active_sh_degree,
+            storage_sh_degree,
             total_splats,
             num_visible: 0, // num_visible — not yet known.
             jacobian_clamp_limits: calculate_jacobian_clamp_limits(
@@ -213,7 +219,8 @@ impl SplatOps for MainBackendBase {
                 projected_splats.clone().into_tensor_arg(),
                 uniforms,
                 mip_splat,
-                sh_degree,
+                storage_sh_degree,
+                active_sh_degree,
                 camera.camera_model,
             );
         });

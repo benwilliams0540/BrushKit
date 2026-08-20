@@ -4,6 +4,7 @@ use brush_vfs::DataSource;
 use glam::Vec3;
 
 use crate::config::TrainStreamConfig;
+use crate::progressive_sh::ShTransitionReason;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TelemetryBoundary {
@@ -86,6 +87,18 @@ pub enum TrainMessage {
     },
     Initializer {
         report: InitializerReport,
+    },
+    /// Typed progressive-SH state change, emitted before the affected
+    /// zero-based training iteration.
+    ShDegreeChanged {
+        zero_based_iteration: u32,
+        maximum_degree: u32,
+        active_degree: u32,
+        initial_degree: u32,
+        step_interval: u32,
+        schedule_mode: u32,
+        schedule_identity: u64,
+        reason: ShTransitionReason,
     },
     /// Eval was run successfully with these results.
     #[allow(unused)]

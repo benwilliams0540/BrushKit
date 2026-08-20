@@ -12,7 +12,7 @@ use brush_render::{
     gaussian_splats::{SplatRenderMode, Splats},
     kernels::camera_model::CameraModel::Pinhole,
 };
-use brush_render_bwd::render_splats;
+use brush_render_bwd::{render_splats, render_splats_with_active_sh_degree};
 use brush_train::{config::TrainConfig, train::SplatTrainer};
 use burn::module::AutodiffModule;
 use burn::tensor::{Device, TensorData};
@@ -183,6 +183,99 @@ async fn test_forward_rendering() {
 }
 
 #[wasm_bindgen_test(unsupported = tokio::test)]
+async fn progressive_sh_excludes_inactive_forward_and_backward_bands() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let camera = Camera::new(
+        Vec3::new(0.0, 0.0, -3.0),
+        Quat::IDENTITY,
+        45.0,
+        45.0,
+        glam::vec2(0.5, 0.5),
+        Pinhole,
+    );
+    let img_size = glam::uvec2(32, 32);
+    let mut full_coefficients = vec![0.0f32; 16 * 3];
+    full_coefficients[0..3].copy_from_slice(&[0.2, 0.3, 0.4]);
+    for (index, coefficient) in full_coefficients[3..].iter_mut().enumerate() {
+        *coefficient = (index as f32 + 1.0) * 0.025;
+    }
+    let dc_only_coefficients = {
+        let mut coefficients = vec![0.0f32; 16 * 3];
+        coefficients[0..3].copy_from_slice(&full_coefficients[0..3]);
+        coefficients
+    };
+    let make_splats = |coefficients: Vec<f32>| {
+        Splats::from_raw(
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![-0.4, -0.4, -0.4],
+            coefficients,
+            vec![2.0],
+            SplatRenderMode::Default,
+            &device,
+        )
+    };
+
+    let full = make_splats(full_coefficients);
+    assert_eq!(full.sh_degree(), 3);
+    let active_zero =
+        render_splats_with_active_sh_degree(full.clone(), &camera, img_size, Vec3::ZERO, 0).await;
+    assert!(active_zero.num_visible > 0, "test splat must be visible");
+    let dc_only = render_splats_with_active_sh_degree(
+        make_splats(dc_only_coefficients),
+        &camera,
+        img_size,
+        Vec3::ZERO,
+        0,
+    )
+    .await;
+    let active_pixels = active_zero
+        .img
+        .clone()
+        .into_data_async()
+        .await
+        .expect("active SH0 image readback")
+        .into_vec::<f32>()
+        .expect("active SH0 image values");
+    let dc_pixels = dc_only
+        .img
+        .into_data_async()
+        .await
+        .expect("DC-only image readback")
+        .into_vec::<f32>()
+        .expect("DC-only image values");
+    assert_eq!(
+        active_pixels, dc_pixels,
+        "inactive bands changed forward output"
+    );
+
+    let mut gradients = active_zero.img.mean().backward();
+    let sh_gradient = full
+        .sh_coeffs
+        .grad_remove(&mut gradients)
+        .expect("SH gradient missing")
+        .into_data_async()
+        .await
+        .expect("SH gradient readback")
+        .into_vec::<f32>()
+        .expect("SH gradient values");
+    assert_eq!(
+        sh_gradient.len(),
+        16 * 3,
+        "full SH3 gradient stride changed"
+    );
+    assert!(
+        sh_gradient[0..3].iter().any(|value| *value != 0.0),
+        "active DC gradient must be nonzero"
+    );
+    assert!(
+        sh_gradient[3..].iter().all(|value| *value == 0.0),
+        "inactive SH1-SH3 gradients must be exactly zero"
+    );
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
 async fn test_training_step() {
     let device =
         burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
@@ -197,6 +290,33 @@ async fn test_training_step() {
     let (final_splats, _stats) = trainer.step(batch, splats).await;
 
     assert!(final_splats.num_splats() > 0);
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn progressive_sh_refinement_keeps_full_sh3_stride_across_activation() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let config = TrainConfig::default();
+    let mut trainer = SplatTrainer::new(
+        &config,
+        &device,
+        BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+    );
+    trainer.set_active_sh_degree(0, true);
+    let splats = generate_test_splats(&device, 32).with_sh_degree(3);
+    let (splats, _) = trainer.step(generate_test_batch((32, 32)), splats).await;
+    let splats = splats.valid();
+    assert_eq!(splats.sh_degree(), 3);
+    let (splats, _) = trainer.refine(1, splats).await;
+    assert_eq!(splats.sh_degree(), 3);
+
+    trainer.set_active_sh_degree(1, true);
+    let splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
+    let (splats, _) = trainer.step(generate_test_batch((32, 32)), splats).await;
+    let splats = splats.valid();
+    assert_eq!(splats.sh_degree(), 3);
+    let (splats, _) = trainer.refine(2, splats).await;
+    assert_eq!(splats.sh_degree(), 3);
 }
 
 #[wasm_bindgen_test(unsupported = test)]
