@@ -28,8 +28,8 @@ let package = Package(
     ),
     .binaryTarget(
       name: "BrushKitFFI",
-      url: "https://github.com/benwilliams0540/BrushKit/releases/download/brushkit-ffi-v0.3.2/BrushKitFFI.xcframework.zip",
-      checksum: "66151a697763aad7e8ef2aebac1b883b6517a6500d1dc391ba7f7e03a56fa9b6"
+      url: "https://github.com/benwilliams0540/BrushKit/releases/download/brushkit-ffi-v0.4.0/BrushKitFFI.xcframework.zip",
+      checksum: "288e571bdc7da71dcded5a2ab075c05baf145734e329acf3c93b5de892ca60a7"
     )
   ]
 )
